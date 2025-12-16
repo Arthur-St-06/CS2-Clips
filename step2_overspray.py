@@ -103,7 +103,16 @@ def main():
             "time_to_death_after_burst_s": (death_tick - end_tick) / args.tickrate
         })
 
-    df = pd.DataFrame(oversprays).sort_values(
+    df = pd.DataFrame(oversprays)
+
+    if df.empty:
+        df.to_parquet(out / "overspray_candidates.parquet")
+        print(f"Spray-like bursts: {len(bursts)}")
+        print("Overspray candidates (die soon, no kill): 0")
+        print(f"Saved: {out/'overspray_candidates.parquet'} (empty)")
+        return
+
+    df = df.sort_values(
         ["player", "bullets", "duration_s"],
         ascending=[True, False, False]
     )

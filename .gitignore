@@ -1,8 +1,5 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
 *.egg-info/
 dist/
 build/
@@ -16,12 +13,14 @@ venv/
 out_sprays/
 *.parquet
 *.jsonl
+*.json
 *.mp4
 *.mkv
 *.log
 
 # demos (large binaries)
 *.dem
+*.dem.info
 
 # OS/editor
 .DS_Store
