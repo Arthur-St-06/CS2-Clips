@@ -17,6 +17,7 @@ out_sprays/
 *.mp4
 *.mkv
 *.log
+*.txt
 
 # demos (large binaries)
 *.dem
