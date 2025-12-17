@@ -171,11 +171,7 @@ No movement-related deaths were detected (moving shots + death within 1.5s).
     avg_spd = df["max_speed_2d"].mean() if shown else 0
     avg_ttd = df["time_to_death_after_moving_shot_s"].mean() if shown else 0
 
-    summary = f"""Shooting while moving (no full stop / no counter-strafe)
-Match time (local): {played_at_local_s}
-Match time (UTC):   {played_at_utc_s}
-
-Detected {total} candidate cases where you fired while moving and died soon after.
+    summary = f"""Detected {total} candidate cases where you fired while moving and died soon after.
 
 Top {shown} exported clips:
 - Avg shots while moving (per incident): {avg_shots:.1f}

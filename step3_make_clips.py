@@ -192,11 +192,7 @@ Nice job — either you didn’t over-spray, or the situations didn’t lead to 
     avg_dur = df["duration_s"].mean() if shown else 0
     avg_ttd = df["time_to_death_after_burst_s"].mean() if shown else 0
 
-    summary = f"""Over-spraying instead of resetting
-Match time (local): {played_at_local_s}
-Match time (UTC):   {played_at_utc_s}
-
-Detected {total} candidate cases where you kept spraying, got no kill, and died soon after.
+    summary = f"""Detected {total} candidate cases where you kept spraying, got no kill, and died soon after.
 
 Top {shown} exported clips:
 - Avg bullets: {avg_bul:.1f}

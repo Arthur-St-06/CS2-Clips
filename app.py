@@ -45,9 +45,6 @@ def played_at_from_dem_info_via_protoc(demo_path: Path) -> datetime | None:
         return None
 
     epoch = int(m.group(1))
-    if not (1_600_000_000 <= epoch <= 2_200_000_000):
-        return None
-
     return datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone()
 
 
@@ -301,7 +298,7 @@ def run_pipeline(
 
     # Clip movement incidents
     cmd3m = [
-        "python3", "step3_make_clips_movement.py",   # <-- ensure file name matches
+        "python3", "step3_make_clips_movement.py",  # ensure file name matches your repo
         "--out", str(out),
         "--demo", str(demo),
         "--video", str(video),
@@ -355,7 +352,6 @@ def _show_mistake_panel(
     coaching_path: Path,
     candidates_path: Path,
     clips_dir: Path,
-    show_existing: bool,
 ):
     st.markdown(f"### {title}")
 
@@ -366,10 +362,6 @@ def _show_mistake_panel(
     c1.metric("Candidates", cand_n)
     c2.metric("Clips", clip_n)
     c3.metric("Status", "Ready" if clip_n > 0 else ("Detected" if cand_n > 0 else "None"))
-
-    if not show_existing:
-        st.info("Outputs hidden. Enable 'Show existing outputs' to view coaching + clips.")
-        return
 
     if coaching_path.exists():
         st.markdown("**Coaching**")
@@ -387,12 +379,51 @@ def _show_mistake_panel(
                 st.video(str(c))
 
 
+def _fmt_duration_min(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "? min"
+    try:
+        return f"{float(v):.1f} min"
+    except Exception:
+        return "? min"
+
+
+def _fmt_played_at(v) -> str:
+    try:
+        if hasattr(v, "to_pydatetime"):
+            v = v.to_pydatetime()
+        if isinstance(v, datetime):
+            return v.astimezone().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        return str(v)
+    except Exception:
+        return "Unknown"
+
+
 # =========================
 # Streamlit UI
 # =========================
 
 st.set_page_config(page_title="CS2 Coach MVP", layout="wide")
-st.title("CS2 Coach — MVP")
+
+st.markdown(
+    """
+    <style>
+      /* Keep MAIN content safely below the Streamlit header */
+      .block-container { padding-top: 2.25rem !important; }
+
+      /* Make SIDEBAR match the same top padding */
+      section[data-testid="stSidebar"] .block-container {
+        padding-top: 2.25rem !important;
+      }
+
+      /* Don’t kill the title spacing (it causes clipping) */
+      h1 { margin-top: 0.5rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("CS2 Coach - MVP")
 
 with st.sidebar:
     st.header("Inputs")
@@ -410,19 +441,18 @@ with st.sidebar:
     st.divider()
     st.header("Pipeline settings")
     player_filter = st.text_input("Player filter (name substring)", value="")
-    tickrate = st.number_input("Tickrate", min_value=16.0, max_value=256.0, value=64.0, step=1.0)
+    # Not sure if should add it to the UI TODO
+    # tickrate = st.number_input("Tickrate", min_value=16.0, max_value=256.0, value=64.0, step=1.0)
+    tickrate = 64
     top = st.slider("Clips to export (top)", 1, 20, 5)
     pre = st.number_input("Clip pre-roll (sec)", min_value=0.0, max_value=15.0, value=3.0, step=0.5)
     post = st.number_input("Clip post-roll (sec)", min_value=0.0, max_value=15.0, value=2.0, step=0.5)
 
-    st.divider()
-    st.header("Auto-match demo ↔ video")
-    max_window_h = st.slider("Max match window (hours)", 1, 24, 12)
-
-    st.divider()
-    if st.button("Clear Streamlit cache (fix stale times)"):
-        st.cache_data.clear()
-        st.rerun()
+    # Not sure if should add it to the UI TODO
+    # st.divider()
+    # st.header("Auto-match demo ↔ video")
+    # max_window_h = st.slider("Max match window (hours)", 1, 24, 12)
+    max_window_h = 12
 
 demo_dir_p = Path(demo_dir).expanduser()
 video_dir_p = Path(video_dir).expanduser()
@@ -445,22 +475,13 @@ if df.empty:
     st.info("No .dem files found in that folder.")
     st.stop()
 
-st.subheader("Games")
-df_show = df.copy()
-df_show["played_at"] = df_show["played_at"].astype(str)
-df_show["file_mtime"] = df_show["file_mtime"].astype(str)
-df_show = df_show[["filename", "map", "played_at", "played_at_source", "score", "duration_min", "file_mtime", "path"]]
-st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-st.subheader("Select a game")
 selected_path = st.selectbox(
-    "Demo",
+    "Select a game",
     options=df["path"].tolist(),
     format_func=lambda p: (
-        f"{Path(p).name} — "
-        f"{df.loc[df['path'] == p, 'map'].iloc[0]} — "
-        f"{df.loc[df['path'] == p, 'score'].iloc[0]} — "
-        f"{df.loc[df['path'] == p, 'played_at'].iloc[0]}"
+        f"{df.loc[df['path'] == p, 'map'].iloc[0]} - "
+        f"{_fmt_played_at(df.loc[df['path'] == p, 'played_at'].iloc[0])} - "
+        f"{_fmt_duration_min(df.loc[df['path'] == p, 'duration_min'].iloc[0])}"
     ),
 )
 demo_path = Path(selected_path)
@@ -473,26 +494,11 @@ if video_dir_p.exists():
         max_window_hours=float(max_window_h),
     )
 
-row = df[df["path"] == str(demo_path)].iloc[0]
-col1, col2 = st.columns([1, 1], gap="large")
-
-with col1:
-    st.markdown("### Demo")
-    st.write(f"**Map:** {row['map']}")
-    st.write(f"**Played at:** {row['played_at']} ({row.get('played_at_source', '?')})")
-    st.write(f"**Score:** {row['score']}")
-    st.write(f"**Duration:** {row['duration_min']} min")
-    st.caption(f"File mtime (debug): {row['file_mtime']}")
-
-with col2:
-    st.markdown("### Matched recording")
-    if match is None:
-        st.warning("No close recording found (or videos folder missing).")
-    else:
-        st.write(f"**Video:** `{match.video_path.name}`")
-        st.write(f"**Δ:** {match.delta_seconds:.1f}s")
-        st.write(f"**Anchor used:** {match.used_anchor}")
-        st.video(str(match.video_path))
+if match is None:
+    st.warning("No close recording found (or videos folder missing).")
+else:
+    st.write(f"Matched recording: `{match.video_path.name}`")
+    st.video(str(match.video_path))
 
 st.divider()
 
@@ -501,12 +507,35 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 st.markdown("## Pipeline output")
 
-cA, cB, cC = st.columns([1, 1, 2], gap="small")
-with cA:
-    show_existing = st.checkbox("Show existing outputs", value=False)
-with cB:
-    always_fresh = st.checkbox("Always start fresh on Run", value=True)
-with cC:
+# Run/Reset row (replaces the two checkboxes + bottom run section)
+left, mid, right = st.columns([2, 1, 6], gap="small")
+
+with left:
+    if st.button("Run analysis for this demo", type="primary", disabled=(match is None)):
+        try:
+            # Always start fresh
+            reset_analysis(out_dir)
+
+            with st.spinner("Running overspray + movement pipelines..."):
+                run_pipeline(
+                    demo_path,
+                    match.video_path,  # type: ignore[arg-type]
+                    out_dir,
+                    player_filter=player_filter,
+                    tickrate=float(tickrate),
+                    top=int(top),
+                    pre=float(pre),
+                    post=float(post),
+                )
+
+            st.success("Done. New coaching + clips generated.")
+            st.rerun()
+        except subprocess.CalledProcessError as e:
+            st.error(f"Pipeline failed (exit {e.returncode}). Check your terminal output.")
+        except Exception as e:
+            st.error(str(e))
+
+with right:
     if st.button("Reset analysis (delete outputs)"):
         reset_analysis(out_dir)
         st.success("Cleared outputs for this demo.")
@@ -530,7 +559,6 @@ with tab1:
         coaching_path=coaching_overspray,
         candidates_path=overspray_candidates,
         clips_dir=clips_overspray,
-        show_existing=show_existing,
     )
 
 with tab2:
@@ -539,36 +567,4 @@ with tab2:
         coaching_path=coaching_move,
         candidates_path=move_candidates,
         clips_dir=clips_move,
-        show_existing=show_existing,
     )
-
-st.divider()
-st.markdown("## Run analysis")
-
-can_run = match is not None
-if not can_run:
-    st.warning("Need a matched video to run automatically. (Or set a bigger match window.)")
-else:
-    if st.button("Run analysis for this demo", type="primary"):
-        try:
-            if always_fresh:
-                reset_analysis(out_dir)
-
-            with st.spinner("Running overspray + movement pipelines..."):
-                run_pipeline(
-                    demo_path,
-                    match.video_path,
-                    out_dir,
-                    player_filter=player_filter,
-                    tickrate=float(tickrate),
-                    top=int(top),
-                    pre=float(pre),
-                    post=float(post),
-                )
-
-            st.success("Done. New coaching + clips generated.")
-            st.rerun()
-        except subprocess.CalledProcessError as e:
-            st.error(f"Pipeline failed (exit {e.returncode}). Check your terminal output.")
-        except Exception as e:
-            st.error(str(e))
