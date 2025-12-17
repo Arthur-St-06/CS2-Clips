@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -20,18 +20,10 @@ def _local_dt_from_mtime(p: Path) -> datetime:
 
 
 def played_at_from_dem_info_via_protoc(demo_path: Path) -> datetime | None:
-    """
-    Extracts match start time shown by CS2 UI from <demo>.dem.info.
-    We observed: top-level protobuf field 2 is epoch seconds UTC.
-      e.g. `2: 1765821408` -> 2025-12-15 09:56 local (PST)
-    """
     dem = demo_path.expanduser().resolve()
 
-    # demo.dem -> demo.dem.info
-    info1 = Path(str(dem) + ".info")
-    # some tools may use demo.dem + ".info" already; this covers both patterns
+    info1 = Path(str(dem) + ".info")  # demo.dem -> demo.dem.info
     info2 = dem.with_suffix(dem.suffix + ".info")
-
     info = info1 if info1.exists() else info2 if info2.exists() else None
     if info is None:
         return None
@@ -48,14 +40,11 @@ def played_at_from_dem_info_via_protoc(demo_path: Path) -> datetime | None:
         return None
 
     txt = p.stdout.decode("utf-8", errors="replace")
-
-    # We want the top-level line: 2: <epoch>
     m = re.search(r"(?m)^2:\s*(\d+)\s*$", txt)
     if not m:
         return None
 
     epoch = int(m.group(1))
-    # sanity range (adjust if needed, but this keeps garbage out)
     if not (1_600_000_000 <= epoch <= 2_200_000_000):
         return None
 
@@ -128,12 +117,12 @@ def summarize_demo(demo_path: Path, tickrate: float = 64.0) -> dict:
 
         # duration: max tick over seen events
         max_tick = None
-        for df in (rounds, deaths):
-            if df is None or df.empty:
+        for dfi in (rounds, deaths):
+            if dfi is None or dfi.empty:
                 continue
-            tc = _pick_tick_col(df)
+            tc = _pick_tick_col(dfi)
             if tc:
-                v = int(df[tc].max())
+                v = int(dfi[tc].max())
                 max_tick = v if max_tick is None else max(max_tick, v)
 
         if max_tick is not None:
@@ -169,7 +158,6 @@ def index_demos(demo_dir: Path, tickrate: float = 64.0) -> pd.DataFrame:
     demos = sorted(demo_dir.glob("*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
     rows = [summarize_demo(p, tickrate=tickrate) for p in demos]
     df = pd.DataFrame(rows)
-    # sort by played_at (real) desc, fallback is mtime anyway
     if not df.empty and "played_at" in df.columns:
         df = df.sort_values("played_at", ascending=False)
     return df
@@ -202,12 +190,6 @@ def _list_videos(video_dir: Path) -> list[Path]:
 
 
 def _demo_candidate_times(demo_path: Path) -> list[tuple[str, datetime]]:
-    """
-    Candidates for matching:
-    - played_at from dem.info (best)
-    - file mtime (fallback)
-    We also allow timezone shift brute-force because video mtime can be local vs weird.
-    """
     cands: list[tuple[str, datetime]] = []
     played_at = played_at_from_dem_info_via_protoc(demo_path)
     if played_at is not None:
@@ -255,9 +237,15 @@ def match_demo_to_video(
 
 def reset_analysis(out_dir: Path):
     files = [
+        # overspray
         out_dir / "coaching.txt",
         out_dir / "bursts.parquet",
         out_dir / "overspray_candidates.parquet",
+        # movement
+        out_dir / "shoot_move_candidates.parquet",
+        out_dir / "coaching_move.txt",
+        out_dir / "shooting_while_moving.parquet",
+        out_dir / "shooting_while_moving.csv",
     ]
     for f in files:
         try:
@@ -266,25 +254,67 @@ def reset_analysis(out_dir: Path):
         except Exception:
             pass
 
-    clips_dir = out_dir / "clips"
-    if clips_dir.exists():
-        for mp4 in clips_dir.glob("*.mp4"):
-            try:
-                mp4.unlink()
-            except Exception:
-                pass
+    for d in (out_dir / "clips", out_dir / "clips_move"):
+        if d.exists():
+            for mp4 in d.glob("*.mp4"):
+                try:
+                    mp4.unlink()
+                except Exception:
+                    pass
 
 
-def run_pipeline(demo: Path, video: Path, out: Path, *, player_filter: str, tickrate: float, top: int, pre: float, post: float):
+def run_pipeline(
+    demo: Path,
+    video: Path,
+    out: Path,
+    *,
+    player_filter: str,
+    tickrate: float,
+    top: int,
+    pre: float,
+    post: float,
+):
+    # Overspray
     cmd1 = ["python3", "step1_bursts.py", "--demo", str(demo), "--out", str(out)]
     if player_filter.strip():
         cmd1 += ["--player", player_filter.strip()]
     subprocess.run(cmd1, check=True)
 
-    cmd2 = ["python3", "step2_overspray.py", "--demo", str(demo), "--out", str(out), "--tickrate", str(float(tickrate))]
+    cmd2 = [
+        "python3", "step2_overspray.py",
+        "--demo", str(demo),
+        "--out", str(out),
+        "--tickrate", str(float(tickrate)),
+    ]
     subprocess.run(cmd2, check=True)
 
-    # IMPORTANT: pass --demo so step3 can read .dem.info and write correct match time
+    # Movement (death-linked incidents)
+    cmd2m = [
+        "python3", "step2_shoot_move.py",
+        "--demo", str(demo),
+        "--out", str(out),
+        "--tickrate", str(float(tickrate)),
+    ]
+    if player_filter.strip():
+        cmd2m += ["--player", player_filter.strip()]
+    subprocess.run(cmd2m, check=True)
+
+    # Clip movement incidents
+    cmd3m = [
+        "python3", "step3_make_clips_movement.py",   # <-- ensure file name matches
+        "--out", str(out),
+        "--demo", str(demo),
+        "--video", str(video),
+        "--tickrate", str(float(tickrate)),
+        "--top", str(int(top)),
+        "--pre", str(float(pre)),
+        "--post", str(float(post)),
+    ]
+    if player_filter.strip():
+        cmd3m += ["--prefer-player", player_filter.strip()]
+    subprocess.run(cmd3m, check=True)
+
+    # Clip overspray incidents
     cmd3 = [
         "python3", "step3_make_clips.py",
         "--out", str(out),
@@ -295,7 +325,66 @@ def run_pipeline(demo: Path, video: Path, out: Path, *, player_filter: str, tick
         "--pre", str(float(pre)),
         "--post", str(float(post)),
     ]
+    if player_filter.strip():
+        cmd3 += ["--prefer-player", player_filter.strip()]
     subprocess.run(cmd3, check=True)
+
+
+# =========================
+# UI helpers
+# =========================
+
+def _read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _count_parquet_rows(p: Path) -> int:
+    try:
+        df = pd.read_parquet(p)
+        return len(df)
+    except Exception:
+        return 0
+
+
+def _show_mistake_panel(
+    *,
+    title: str,
+    coaching_path: Path,
+    candidates_path: Path,
+    clips_dir: Path,
+    show_existing: bool,
+):
+    st.markdown(f"### {title}")
+
+    cand_n = _count_parquet_rows(candidates_path) if candidates_path.exists() else 0
+    clip_n = len(list(clips_dir.glob("*.mp4"))) if clips_dir.exists() else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Candidates", cand_n)
+    c2.metric("Clips", clip_n)
+    c3.metric("Status", "Ready" if clip_n > 0 else ("Detected" if cand_n > 0 else "None"))
+
+    if not show_existing:
+        st.info("Outputs hidden. Enable 'Show existing outputs' to view coaching + clips.")
+        return
+
+    if coaching_path.exists():
+        st.markdown("**Coaching**")
+        st.code(_read_text(coaching_path), language="text")
+    else:
+        st.info("No coaching file yet. Run analysis.")
+
+    with st.expander("Show clips", expanded=False):
+        clips = sorted(clips_dir.glob("*.mp4"))
+        if not clips:
+            st.info("No clips yet.")
+        else:
+            for c in clips:
+                st.write(f"**{c.name}**")
+                st.video(str(c))
 
 
 # =========================
@@ -335,7 +424,6 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-
 demo_dir_p = Path(demo_dir).expanduser()
 video_dir_p = Path(video_dir).expanduser()
 workspace_p = Path(workspace_dir).expanduser()
@@ -370,9 +458,9 @@ selected_path = st.selectbox(
     options=df["path"].tolist(),
     format_func=lambda p: (
         f"{Path(p).name} — "
-        f"{df.loc[df['path']==p,'map'].iloc[0]} — "
-        f"{df.loc[df['path']==p,'score'].iloc[0]} — "
-        f"{df.loc[df['path']==p,'played_at'].iloc[0]}"
+        f"{df.loc[df['path'] == p, 'map'].iloc[0]} — "
+        f"{df.loc[df['path'] == p, 'score'].iloc[0]} — "
+        f"{df.loc[df['path'] == p, 'played_at'].iloc[0]}"
     ),
 )
 demo_path = Path(selected_path)
@@ -382,7 +470,7 @@ if video_dir_p.exists():
     match = match_demo_to_video(
         demo_path,
         video_dir_p,
-        max_window_hours=float(max_window_h)
+        max_window_hours=float(max_window_h),
     )
 
 row = df[df["path"] == str(demo_path)].iloc[0]
@@ -391,7 +479,7 @@ col1, col2 = st.columns([1, 1], gap="large")
 with col1:
     st.markdown("### Demo")
     st.write(f"**Map:** {row['map']}")
-    st.write(f"**Played at:** {row['played_at']} ({row.get('played_at_source','?')})")
+    st.write(f"**Played at:** {row['played_at']} ({row.get('played_at_source', '?')})")
     st.write(f"**Score:** {row['score']}")
     st.write(f"**Duration:** {row['duration_min']} min")
     st.caption(f"File mtime (debug): {row['file_mtime']}")
@@ -409,9 +497,7 @@ with col2:
 st.divider()
 
 out_dir = workspace_p / demo_path.stem
-clips_dir = out_dir / "clips"
-clips_dir.mkdir(parents=True, exist_ok=True)
-coaching_txt = out_dir / "coaching.txt"
+out_dir.mkdir(parents=True, exist_ok=True)
 
 st.markdown("## Pipeline output")
 
@@ -423,26 +509,38 @@ with cB:
 with cC:
     if st.button("Reset analysis (delete outputs)"):
         reset_analysis(out_dir)
-        st.success("Cleared coaching.txt / parquet files / clips for this demo.")
+        st.success("Cleared outputs for this demo.")
         st.rerun()
 
-if show_existing and coaching_txt.exists():
-    st.markdown("### Coaching summary")
-    st.code(coaching_txt.read_text(encoding="utf-8"), language="text")
-elif show_existing:
-    st.info("No coaching.txt yet. Run analysis below.")
-else:
-    st.info("Existing outputs hidden. Run analysis to generate fresh outputs (or enable 'Show existing outputs').")
+# Paths for tabs
+coaching_overspray = out_dir / "coaching.txt"
+overspray_candidates = out_dir / "overspray_candidates.parquet"
+clips_overspray = out_dir / "clips"
 
-st.markdown("### Clips")
-if show_existing:
-    clips = sorted(clips_dir.glob("*.mp4"))
-    if not clips:
-        st.info("No clips yet.")
-    else:
-        for c in clips:
-            st.write(f"**{c.name}**")
-            st.video(str(c))
+coaching_move = out_dir / "coaching_move.txt"
+move_candidates = out_dir / "shoot_move_candidates.parquet"
+clips_move = out_dir / "clips_move"
+
+st.markdown("## Mistakes")
+tab1, tab2 = st.tabs(["Overspray", "Shooting while moving"])
+
+with tab1:
+    _show_mistake_panel(
+        title="Over-spraying instead of resetting",
+        coaching_path=coaching_overspray,
+        candidates_path=overspray_candidates,
+        clips_dir=clips_overspray,
+        show_existing=show_existing,
+    )
+
+with tab2:
+    _show_mistake_panel(
+        title="Shooting while moving (no full stop / no counter-strafe)",
+        coaching_path=coaching_move,
+        candidates_path=move_candidates,
+        clips_dir=clips_move,
+        show_existing=show_existing,
+    )
 
 st.divider()
 st.markdown("## Run analysis")
@@ -453,11 +551,10 @@ if not can_run:
 else:
     if st.button("Run analysis for this demo", type="primary"):
         try:
-            out_dir.mkdir(parents=True, exist_ok=True)
             if always_fresh:
                 reset_analysis(out_dir)
 
-            with st.spinner("Running step1 → step2 → step3..."):
+            with st.spinner("Running overspray + movement pipelines..."):
                 run_pipeline(
                     demo_path,
                     match.video_path,
@@ -469,7 +566,7 @@ else:
                     post=float(post),
                 )
 
-            st.success("Done. New coaching summary + clips generated.")
+            st.success("Done. New coaching + clips generated.")
             st.rerun()
         except subprocess.CalledProcessError as e:
             st.error(f"Pipeline failed (exit {e.returncode}). Check your terminal output.")
