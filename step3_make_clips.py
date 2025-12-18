@@ -172,17 +172,13 @@ Nice job — either you didn’t over-spray, or the situations didn’t lead to 
         out_path = clips_dir / out_name
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{start:.3f}",
-            "-to", f"{end:.3f}",
-            "-i", video_path,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "160k",
-            str(out_path)
+          "ffmpeg", "-hide_banner", "-loglevel", "error",
+          "-ss", f"{start:.3f}",
+          "-to", f"{end:.3f}",
+          "-i", video_path,
+          "-c", "copy",
+          "-movflags", "+faststart",
+          str(out_path),
         ]
         run(cmd)
 

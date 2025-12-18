@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from demoparser2 import DemoParser  # type: ignore
-
+import json
 
 # =========================
 # Time helpers
@@ -270,6 +270,7 @@ def run_pipeline(
     top: int,
     pre: float,
     post: float,
+    video_anchor_s: float | None = None
 ):
     # Overspray
     cmd1 = ["python3", "step1_bursts.py", "--demo", str(demo), "--out", str(out)]
@@ -309,6 +310,9 @@ def run_pipeline(
     ]
     if player_filter.strip():
         cmd3m += ["--prefer-player", player_filter.strip()]
+    if video_anchor_s is not None:
+        cmd3m += ["--video-anchor-s", str(float(video_anchor_s))]
+
     subprocess.run(cmd3m, check=True)
 
     # Clip overspray incidents
@@ -324,6 +328,9 @@ def run_pipeline(
     ]
     if player_filter.strip():
         cmd3 += ["--prefer-player", player_filter.strip()]
+    if video_anchor_s is not None:
+        cmd3 += ["--video-anchor-s", str(float(video_anchor_s))]
+
     subprocess.run(cmd3, check=True)
 
 
@@ -398,6 +405,23 @@ def _fmt_played_at(v) -> str:
     except Exception:
         return "Unknown"
 
+# =========================
+# Cache
+# =========================
+
+def _sync_cache_path(out_dir: Path) -> Path:
+    return out_dir / "sync_offset.json"
+
+def _load_cached_video_anchor(out_dir: Path) -> float | None:
+    p = _sync_cache_path(out_dir)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        v = data.get("video_anchor_s")
+        return float(v) if v is not None else None
+    except Exception:
+        return None
 
 # =========================
 # Streamlit UI
@@ -498,12 +522,34 @@ if match is None:
     st.warning("No close recording found (or videos folder missing).")
 else:
     st.write(f"Matched recording: `{match.video_path.name}`")
-    st.video(str(match.video_path))
+    show = st.checkbox("Preview recording", value=False, key="show_preview_video")
+    if show:
+        st.video(str(match.video_path))
 
 st.divider()
 
 out_dir = workspace_p / demo_path.stem
 out_dir.mkdir(parents=True, exist_ok=True)
+
+video_anchor_s: float | None = None
+
+if match is not None:
+    # Fast path: reuse cache
+    video_anchor_s = _load_cached_video_anchor(out_dir)
+
+    # Slow path: compute once (detector also writes cache)
+    if video_anchor_s is None:
+        cache_json = _sync_cache_path(out_dir)
+        cmd = [
+            "python3", "timer_flip_detector.py",
+            "--video", str(match.video_path),
+            "--cache-json", str(cache_json),
+            # keep args here if you override defaults; otherwise you can omit them
+        ]
+        p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True)
+        video_anchor_s = float(p.stdout.strip())
+
+    st.caption(f"Auto-sync anchor: {video_anchor_s:.3f}s (cached in { _sync_cache_path(out_dir).name })")
 
 st.markdown("## Pipeline output")
 
@@ -526,6 +572,7 @@ with left:
                     top=int(top),
                     pre=float(pre),
                     post=float(post),
+                    video_anchor_s=video_anchor_s
                 )
 
             st.success("Done. New coaching + clips generated.")
