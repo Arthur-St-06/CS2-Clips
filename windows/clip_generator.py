@@ -3,7 +3,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 @dataclass
 class Job:
     cs2_exe: Path
@@ -209,7 +208,6 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
                     pass
 
     return mp4
-
 
 if __name__ == "__main__":
     job = Job(

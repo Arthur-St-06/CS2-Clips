@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from dataclasses import dataclass
@@ -9,7 +10,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from demoparser2 import DemoParser  # type: ignore
-import json
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # Time helpers
@@ -85,7 +87,6 @@ def summarize_demo(demo_path: Path, tickrate: float = 64.0) -> dict:
     demo_path = demo_path.resolve()
     parser = DemoParser(str(demo_path))
 
-    # Map name
     map_name = "Unknown"
     try:
         hdr = parser.parse_header()
@@ -94,13 +95,11 @@ def summarize_demo(demo_path: Path, tickrate: float = 64.0) -> dict:
     except Exception:
         pass
 
-    # Played-at (REAL): prefer .dem.info (CS2 UI time), fallback to mtime
     played_at = played_at_from_dem_info_via_protoc(demo_path)
     played_at_source = "dem.info" if played_at is not None else "mtime"
     if played_at is None:
         played_at = _local_dt_from_mtime(demo_path)
 
-    # Also keep file mtime for debugging
     file_mtime = _local_dt_from_mtime(demo_path)
 
     score = "?"
@@ -112,7 +111,6 @@ def summarize_demo(demo_path: Path, tickrate: float = 64.0) -> dict:
         rounds = ev.get("round_end", pd.DataFrame())
         deaths = ev.get("player_death", pd.DataFrame())
 
-        # duration: max tick over seen events
         max_tick = None
         for dfi in (rounds, deaths):
             if dfi is None or dfi.empty:
@@ -125,7 +123,6 @@ def summarize_demo(demo_path: Path, tickrate: float = 64.0) -> dict:
         if max_tick is not None:
             duration_min = round((max_tick / tickrate) / 60.0, 1)
 
-        # score: count round winners if available
         if rounds is not None and not rounds.empty:
             for wcol in ("winner", "winner_side", "winning_side", "team_winner"):
                 if wcol in rounds.columns:
@@ -234,11 +231,9 @@ def match_demo_to_video(
 
 def reset_analysis(out_dir: Path):
     files = [
-        # overspray
         out_dir / "coaching.txt",
         out_dir / "bursts.parquet",
         out_dir / "overspray_candidates.parquet",
-        # movement
         out_dir / "shoot_move_candidates.parquet",
         out_dir / "coaching_move.txt",
         out_dir / "shooting_while_moving.parquet",
@@ -270,9 +265,8 @@ def run_pipeline(
     top: int,
     pre: float,
     post: float,
-    video_anchor_s: float | None = None
+    video_anchor_s: float | None = None,
 ):
-    # Overspray
     cmd1 = ["python3", "step1_bursts.py", "--demo", str(demo), "--out", str(out)]
     if player_filter.strip():
         cmd1 += ["--player", player_filter.strip()]
@@ -286,7 +280,6 @@ def run_pipeline(
     ]
     subprocess.run(cmd2, check=True)
 
-    # Movement (death-linked incidents)
     cmd2m = [
         "python3", "step2_shoot_move.py",
         "--demo", str(demo),
@@ -297,9 +290,8 @@ def run_pipeline(
         cmd2m += ["--player", player_filter.strip()]
     subprocess.run(cmd2m, check=True)
 
-    # Clip movement incidents
     cmd3m = [
-        "python3", "step3_make_clips_movement.py",  # ensure file name matches your repo
+        "python3", "step3_make_clips_movement.py",
         "--out", str(out),
         "--demo", str(demo),
         "--video", str(video),
@@ -312,10 +304,8 @@ def run_pipeline(
         cmd3m += ["--prefer-player", player_filter.strip()]
     if video_anchor_s is not None:
         cmd3m += ["--video-anchor-s", str(float(video_anchor_s))]
-
     subprocess.run(cmd3m, check=True)
 
-    # Clip overspray incidents
     cmd3 = [
         "python3", "step3_make_clips.py",
         "--out", str(out),
@@ -330,7 +320,6 @@ def run_pipeline(
         cmd3 += ["--prefer-player", player_filter.strip()]
     if video_anchor_s is not None:
         cmd3 += ["--video-anchor-s", str(float(video_anchor_s))]
-
     subprocess.run(cmd3, check=True)
 
 
@@ -351,6 +340,26 @@ def _count_parquet_rows(p: Path) -> int:
         return len(df)
     except Exception:
         return 0
+
+
+def _fmt_duration_min(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "? min"
+    try:
+        return f"{float(v):.1f} min"
+    except Exception:
+        return "? min"
+
+
+def _fmt_played_at(v) -> str:
+    try:
+        if hasattr(v, "to_pydatetime"):
+            v = v.to_pydatetime()
+        if isinstance(v, datetime):
+            return v.astimezone().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        return str(v)
+    except Exception:
+        return "Unknown"
 
 
 def _show_mistake_panel(
@@ -386,31 +395,13 @@ def _show_mistake_panel(
                 st.video(str(c))
 
 
-def _fmt_duration_min(v) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return "? min"
-    try:
-        return f"{float(v):.1f} min"
-    except Exception:
-        return "? min"
-
-
-def _fmt_played_at(v) -> str:
-    try:
-        if hasattr(v, "to_pydatetime"):
-            v = v.to_pydatetime()
-        if isinstance(v, datetime):
-            return v.astimezone().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-        return str(v)
-    except Exception:
-        return "Unknown"
-
 # =========================
-# Cache
+# Cache (video anchor)
 # =========================
 
 def _sync_cache_path(out_dir: Path) -> Path:
     return out_dir / "sync_offset.json"
+
 
 def _load_cached_video_anchor(out_dir: Path) -> float | None:
     p = _sync_cache_path(out_dir)
@@ -423,6 +414,70 @@ def _load_cached_video_anchor(out_dir: Path) -> float | None:
     except Exception:
         return None
 
+
+def _get_or_compute_video_anchor(video_path: Path, out_dir: Path) -> float:
+    cached = _load_cached_video_anchor(out_dir)
+    if cached is not None:
+        return cached
+
+    cache_json = _sync_cache_path(out_dir)
+    cmd = [
+        "python3", "timer_flip_detector.py",
+        "--video", str(video_path),
+        "--cache-json", str(cache_json),
+    ]
+    p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True)
+    return float(p.stdout.strip())
+
+
+# =========================
+# Batch helpers
+# =========================
+
+def _paths_for_demo_out(out_dir: Path) -> dict[str, Path]:
+    return {
+        "coaching_overspray": out_dir / "coaching.txt",
+        "overspray_candidates": out_dir / "overspray_candidates.parquet",
+        "clips_overspray": out_dir / "clips",
+        "coaching_move": out_dir / "coaching_move.txt",
+        "move_candidates": out_dir / "shoot_move_candidates.parquet",
+        "clips_move": out_dir / "clips_move",
+    }
+
+
+def _is_already_analyzed(out_dir: Path) -> bool:
+    p = _paths_for_demo_out(out_dir)
+    # consider analyzed if we have any candidates or any clips from either pipeline
+    has_cands = (p["overspray_candidates"].exists() and _count_parquet_rows(p["overspray_candidates"]) > 0) or (
+        p["move_candidates"].exists() and _count_parquet_rows(p["move_candidates"]) > 0
+    )
+    has_clips = (p["clips_overspray"].exists() and any(p["clips_overspray"].glob("*.mp4"))) or (
+        p["clips_move"].exists() and any(p["clips_move"].glob("*.mp4"))
+    )
+    # also treat "ran but no mistakes" as analyzed if files exist
+    has_any_outputs = (
+        p["overspray_candidates"].exists()
+        or p["move_candidates"].exists()
+        or p["coaching_overspray"].exists()
+        or p["coaching_move"].exists()
+    )
+    return bool(has_clips or has_cands or has_any_outputs)
+
+
+def _summarize_out_dir(out_dir: Path) -> dict:
+    p = _paths_for_demo_out(out_dir)
+    over_n = _count_parquet_rows(p["overspray_candidates"]) if p["overspray_candidates"].exists() else 0
+    move_n = _count_parquet_rows(p["move_candidates"]) if p["move_candidates"].exists() else 0
+    over_clips = len(list(p["clips_overspray"].glob("*.mp4"))) if p["clips_overspray"].exists() else 0
+    move_clips = len(list(p["clips_move"].glob("*.mp4"))) if p["clips_move"].exists() else 0
+    return {
+        "overspray_candidates": int(over_n),
+        "move_candidates": int(move_n),
+        "overspray_clips": int(over_clips),
+        "move_clips": int(move_clips),
+    }
+
+
 # =========================
 # Streamlit UI
 # =========================
@@ -432,15 +487,8 @@ st.set_page_config(page_title="CS2 Coach MVP", layout="wide")
 st.markdown(
     """
     <style>
-      /* Keep MAIN content safely below the Streamlit header */
       .block-container { padding-top: 2.25rem !important; }
-
-      /* Make SIDEBAR match the same top padding */
-      section[data-testid="stSidebar"] .block-container {
-        padding-top: 2.25rem !important;
-      }
-
-      /* Don’t kill the title spacing (it causes clipping) */
+      section[data-testid="stSidebar"] .block-container { padding-top: 2.25rem !important; }
       h1 { margin-top: 0.5rem !important; }
     </style>
     """,
@@ -451,7 +499,6 @@ st.title("CS2 Coach - MVP")
 
 with st.sidebar:
     st.header("Inputs")
-
     st.caption("CS2 demos folder (Steam replays). Example:")
     st.code("~/.steam/steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/replays", language="text")
 
@@ -465,17 +512,10 @@ with st.sidebar:
     st.divider()
     st.header("Pipeline settings")
     player_filter = st.text_input("Player filter (name substring)", value="")
-    # Not sure if should add it to the UI TODO
-    # tickrate = st.number_input("Tickrate", min_value=16.0, max_value=256.0, value=64.0, step=1.0)
     tickrate = 64
     top = st.slider("Clips to export (top)", 1, 20, 5)
     pre = st.number_input("Clip pre-roll (sec)", min_value=0.0, max_value=15.0, value=3.0, step=0.5)
     post = st.number_input("Clip post-roll (sec)", min_value=0.0, max_value=15.0, value=2.0, step=0.5)
-
-    # Not sure if should add it to the UI TODO
-    # st.divider()
-    # st.header("Auto-match demo ↔ video")
-    # max_window_h = st.slider("Max match window (hours)", 1, 24, 12)
     max_window_h = 12
 
 demo_dir_p = Path(demo_dir).expanduser()
@@ -499,119 +539,347 @@ if df.empty:
     st.info("No .dem files found in that folder.")
     st.stop()
 
-selected_path = st.selectbox(
-    "Select a game",
-    options=df["path"].tolist(),
-    format_func=lambda p: (
-        f"{df.loc[df['path'] == p, 'map'].iloc[0]} - "
-        f"{_fmt_played_at(df.loc[df['path'] == p, 'played_at'].iloc[0])} - "
-        f"{_fmt_duration_min(df.loc[df['path'] == p, 'duration_min'].iloc[0])}"
-    ),
-)
-demo_path = Path(selected_path)
 
-match = None
-if video_dir_p.exists():
-    match = match_demo_to_video(
-        demo_path,
-        video_dir_p,
-        max_window_hours=float(max_window_h),
+tab_single, tab_batch = st.tabs(["Single demo", "Batch summary (matched videos only)"])
+
+
+# =========================
+# Single demo tab
+# =========================
+with tab_single:
+    selected_path = st.selectbox(
+        "Select a game",
+        options=df["path"].tolist(),
+        format_func=lambda p: (
+            f"{df.loc[df['path'] == p, 'map'].iloc[0]} - "
+            f"{_fmt_played_at(df.loc[df['path'] == p, 'played_at'].iloc[0])} - "
+            f"{_fmt_duration_min(df.loc[df['path'] == p, 'duration_min'].iloc[0])}"
+        ),
+        key="single_select_demo",
     )
+    demo_path = Path(selected_path)
 
-if match is None:
-    st.warning("No close recording found (or videos folder missing).")
-else:
-    st.write(f"Matched recording: `{match.video_path.name}`")
-    show = st.checkbox("Preview recording", value=False, key="show_preview_video")
-    if show:
-        st.video(str(match.video_path))
+    match = None
+    if video_dir_p.exists():
+        match = match_demo_to_video(
+            demo_path,
+            video_dir_p,
+            max_window_hours=float(max_window_h),
+        )
 
-st.divider()
+    if match is None:
+        st.warning("No close recording found (or videos folder missing).")
+    else:
+        st.write(f"Matched recording: `{match.video_path.name}`")
+        show = st.checkbox("Preview recording", value=False, key="show_preview_video_single")
+        if show:
+            st.video(str(match.video_path))
 
-out_dir = workspace_p / demo_path.stem
-out_dir.mkdir(parents=True, exist_ok=True)
+    st.divider()
 
-video_anchor_s: float | None = None
+    out_dir = workspace_p / demo_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-if match is not None:
-    # Fast path: reuse cache
-    video_anchor_s = _load_cached_video_anchor(out_dir)
-
-    # Slow path: compute once (detector also writes cache)
-    if video_anchor_s is None:
-        cache_json = _sync_cache_path(out_dir)
-        cmd = [
-            "python3", "timer_flip_detector.py",
-            "--video", str(match.video_path),
-            "--cache-json", str(cache_json),
-            # keep args here if you override defaults; otherwise you can omit them
-        ]
-        p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True)
-        video_anchor_s = float(p.stdout.strip())
-
-    st.caption(f"Auto-sync anchor: {video_anchor_s:.3f}s (cached in { _sync_cache_path(out_dir).name })")
-
-st.markdown("## Pipeline output")
-
-# Run/Reset row (replaces the two checkboxes + bottom run section)
-left, mid, right = st.columns([2, 1, 6], gap="small")
-
-with left:
-    if st.button("Run analysis for this demo", type="primary", disabled=(match is None)):
+    video_anchor_s: float | None = None
+    if match is not None:
         try:
-            # Always start fresh
+            video_anchor_s = _get_or_compute_video_anchor(match.video_path, out_dir)
+            st.caption(f"Auto-sync anchor: {video_anchor_s:.3f}s (cached in {_sync_cache_path(out_dir).name})")
+        except Exception as e:
+            st.warning(f"Could not compute cached anchor yet: {e}")
+
+    st.markdown("## Pipeline output")
+
+    left, mid, right = st.columns([2, 1, 6], gap="small")
+
+    with left:
+        if st.button("Run analysis for this demo", type="primary", disabled=(match is None), key="run_single"):
+            try:
+                reset_analysis(out_dir)
+
+                with st.spinner("Running overspray + movement pipelines..."):
+                    run_pipeline(
+                        demo_path,
+                        match.video_path,  # type: ignore[arg-type]
+                        out_dir,
+                        player_filter=player_filter,
+                        tickrate=float(tickrate),
+                        top=int(top),
+                        pre=float(pre),
+                        post=float(post),
+                        video_anchor_s=video_anchor_s,
+                    )
+
+                st.success("Done. New coaching + clips generated.")
+                st.rerun()
+            except subprocess.CalledProcessError as e:
+                st.error(f"Pipeline failed (exit {e.returncode}). Check your terminal output.")
+            except Exception as e:
+                st.error(str(e))
+
+    with right:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Clear sync cache", key="clear_sync_single"):
+                try:
+                    _sync_cache_path(out_dir).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                st.success("Cleared sync cache for this demo.")
+                st.rerun()
+
+        with c2:
+            if st.button("Reset analysis (delete outputs)", key="reset_single"):
+                reset_analysis(out_dir)
+                st.success("Cleared outputs for this demo.")
+                st.rerun()
+
+    p = _paths_for_demo_out(out_dir)
+    coaching_overspray = p["coaching_overspray"]
+    overspray_candidates = p["overspray_candidates"]
+    clips_overspray = p["clips_overspray"]
+    coaching_move = p["coaching_move"]
+    move_candidates = p["move_candidates"]
+    clips_move = p["clips_move"]
+
+    st.markdown("## Mistakes")
+    t1, t2 = st.tabs(["Overspray", "Shooting while moving"])
+
+    with t1:
+        _show_mistake_panel(
+            title="Over-spraying instead of resetting",
+            coaching_path=coaching_overspray,
+            candidates_path=overspray_candidates,
+            clips_dir=clips_overspray,
+        )
+
+    with t2:
+        _show_mistake_panel(
+            title="Shooting while moving (no full stop / no counter-strafe)",
+            coaching_path=coaching_move,
+            candidates_path=move_candidates,
+            clips_dir=clips_move,
+        )
+
+# =========================
+# Batch summary tab (Option B) — PARALLEL (up to 4 demos)
+# =========================
+with tab_batch:
+    run_batch = st.button("Run batch analysis", type="primary")
+
+    # Analyze last n demos
+    n = len(df)
+    workers = 4
+    skip_done = False
+    reset_before = True
+
+    if "batch_rows" not in st.session_state:
+        st.session_state["batch_rows"] = []
+
+    def _analyze_one_demo(demo_path: Path, row_dict: dict) -> dict:
+        out_dir = workspace_p / demo_path.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) match video (Option B: skip if no match)
+        match = None
+        if video_dir_p.exists():
+            match = match_demo_to_video(
+                demo_path,
+                video_dir_p,
+                max_window_hours=float(max_window_h),
+            )
+
+        if match is None:
+            return {
+                "demo": demo_path.name,
+                "map": row_dict.get("map", ""),
+                "played_at": _fmt_played_at(row_dict.get("played_at")),
+                "status": "SKIP (no matched video)",
+                "video": "",
+                "overspray": 0,
+                "shoot_move": 0,
+                "overspray_clips": 0,
+                "move_clips": 0,
+            }
+
+        # 2) skip already analyzed (optional)
+        if skip_done and _is_already_analyzed(out_dir):
+            s = _summarize_out_dir(out_dir)
+            return {
+                "demo": demo_path.name,
+                "map": row_dict.get("map", ""),
+                "played_at": _fmt_played_at(row_dict.get("played_at")),
+                "status": "SKIP (already analyzed)",
+                "video": match.video_path.name,
+                "overspray": s["overspray_candidates"],
+                "shoot_move": s["move_candidates"],
+                "overspray_clips": s["overspray_clips"],
+                "move_clips": s["move_clips"],
+            }
+
+        # 3) run analysis
+        if reset_before:
             reset_analysis(out_dir)
 
-            with st.spinner("Running overspray + movement pipelines..."):
-                run_pipeline(
-                    demo_path,
-                    match.video_path,  # type: ignore[arg-type]
-                    out_dir,
-                    player_filter=player_filter,
-                    tickrate=float(tickrate),
-                    top=int(top),
-                    pre=float(pre),
-                    post=float(post),
-                    video_anchor_s=video_anchor_s
+        # cached anchor (computed once per demo/video if missing)
+        video_anchor_s = _get_or_compute_video_anchor(match.video_path, out_dir)
+
+        run_pipeline(
+            demo_path,
+            match.video_path,
+            out_dir,
+            player_filter=player_filter,
+            tickrate=float(tickrate),
+            top=int(top),
+            pre=float(pre),
+            post=float(post),
+            video_anchor_s=video_anchor_s,
+        )
+
+        s = _summarize_out_dir(out_dir)
+        return {
+            "demo": demo_path.name,
+            "map": row_dict.get("map", ""),
+            "played_at": _fmt_played_at(row_dict.get("played_at")),
+            "status": "OK",
+            "video": match.video_path.name,
+            "overspray": s["overspray_candidates"],
+            "shoot_move": s["move_candidates"],
+            "overspray_clips": s["overspray_clips"],
+            "move_clips": s["move_clips"],
+        }
+
+    if run_batch:
+        st.session_state["batch_rows"] = []
+
+        demos = df.head(int(n)).copy().reset_index(drop=True)
+        total = len(demos)
+
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        rows: list[dict] = []
+
+        # Submit all jobs
+        with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+            futures = []
+            for _, r in demos.iterrows():
+                demo_path = Path(str(r["path"]))
+                row_dict = r.to_dict()
+                futures.append(ex.submit(_analyze_one_demo, demo_path, row_dict))
+
+            # Collect as they complete (UI updates here only)
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    rows.append(fut.result())
+                except subprocess.CalledProcessError as e:
+                    # We don't know which demo if the exception happens before returning; keep generic
+                    rows.append({
+                        "demo": "?",
+                        "map": "",
+                        "played_at": "",
+                        "status": f"FAIL (exit {e.returncode})",
+                        "video": "",
+                        "overspray": 0,
+                        "shoot_move": 0,
+                        "overspray_clips": 0,
+                        "move_clips": 0,
+                    })
+                except Exception as e:
+                    rows.append({
+                        "demo": "?",
+                        "map": "",
+                        "played_at": "",
+                        "status": f"FAIL ({type(e).__name__})",
+                        "video": "",
+                        "overspray": 0,
+                        "shoot_move": 0,
+                        "overspray_clips": 0,
+                        "move_clips": 0,
+                    })
+
+                status.write(f"Completed {done}/{total} (parallel workers: {workers})")
+                progress.progress(done / max(1, total))
+
+        # Sort newest first for nicer viewing
+        def _sort_key(x: dict) -> str:
+            # played_at is already formatted string; keep as-is (good enough)
+            return str(x.get("played_at", ""))
+
+        st.session_state["batch_rows"] = sorted(rows, key=_sort_key, reverse=True)
+
+        status.empty()
+        progress.empty()
+
+    rows = st.session_state.get("batch_rows", [])
+    if rows:
+        res = pd.DataFrame(rows)
+
+        ok = int((res["status"] == "OK").sum())
+        skip_nm = int(res["status"].astype(str).str.startswith("SKIP (no matched").sum())
+        skip_an = int(res["status"].astype(str).str.startswith("SKIP (already").sum())
+        fail = int(res["status"].astype(str).str.startswith("FAIL").sum())
+
+        total_over = int(res["overspray"].sum())
+        total_move = int(res["shoot_move"].sum())
+        total_clips = int(res["overspray_clips"].sum() + res["move_clips"].sum())
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Total overspray candidates", total_over)
+        c6.metric("Total shoot-move candidates", total_move)
+        c7.metric("Total clips produced", total_clips)
+
+        st.markdown("### Results")
+        st.dataframe(
+            res.loc[:, ["map", "played_at", "overspray", "shoot_move"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Drilldown")
+        ok_demos = res[res["status"].isin(["OK", "SKIP (already analyzed)"])].copy()
+        if ok_demos.empty:
+            st.info("No analyzable demos yet.")
+
+        else:
+            # Use full demo paths so we can format like single demo
+            ok_demo_names = set(ok_demos["demo"].tolist())
+
+            drill_paths = [p for p in df["path"].tolist() if Path(p).name in ok_demo_names]
+
+            sel_path = st.selectbox(
+                "Select a demo to view outputs",
+                options=drill_paths,
+                format_func=lambda p: (
+                    f"{df.loc[df['path'] == p, 'map'].iloc[0]} - "
+                    f"{_fmt_played_at(df.loc[df['path'] == p, 'played_at'].iloc[0])} - "
+                    f"{_fmt_duration_min(df.loc[df['path'] == p, 'duration_min'].iloc[0])}"
+                ),
+                key="batch_drill_demo",
+            )
+
+            demo_path = Path(sel_path)
+            out_dir = workspace_p / demo_path.stem
+            p = _paths_for_demo_out(out_dir)
+
+            st.write(f"Outputs folder: `{out_dir}`")
+
+            t1, t2 = st.tabs(["Overspray", "Shooting while moving"])
+            with t1:
+                _show_mistake_panel(
+                    title="Over-spraying instead of resetting",
+                    coaching_path=p["coaching_overspray"],
+                    candidates_path=p["overspray_candidates"],
+                    clips_dir=p["clips_overspray"],
                 )
-
-            st.success("Done. New coaching + clips generated.")
-            st.rerun()
-        except subprocess.CalledProcessError as e:
-            st.error(f"Pipeline failed (exit {e.returncode}). Check your terminal output.")
-        except Exception as e:
-            st.error(str(e))
-
-with right:
-    if st.button("Reset analysis (delete outputs)"):
-        reset_analysis(out_dir)
-        st.success("Cleared outputs for this demo.")
-        st.rerun()
-
-# Paths for tabs
-coaching_overspray = out_dir / "coaching.txt"
-overspray_candidates = out_dir / "overspray_candidates.parquet"
-clips_overspray = out_dir / "clips"
-
-coaching_move = out_dir / "coaching_move.txt"
-move_candidates = out_dir / "shoot_move_candidates.parquet"
-clips_move = out_dir / "clips_move"
-
-st.markdown("## Mistakes")
-tab1, tab2 = st.tabs(["Overspray", "Shooting while moving"])
-
-with tab1:
-    _show_mistake_panel(
-        title="Over-spraying instead of resetting",
-        coaching_path=coaching_overspray,
-        candidates_path=overspray_candidates,
-        clips_dir=clips_overspray,
-    )
-
-with tab2:
-    _show_mistake_panel(
-        title="Shooting while moving (no full stop / no counter-strafe)",
-        coaching_path=coaching_move,
-        candidates_path=move_candidates,
-        clips_dir=clips_move,
-    )
+            with t2:
+                _show_mistake_panel(
+                    title="Shooting while moving (no full stop / no counter-strafe)",
+                    coaching_path=p["coaching_move"],
+                    candidates_path=p["move_candidates"],
+                    clips_dir=p["clips_move"],
+                )
+    else:
+        st.info("Run a batch to generate an aggregate summary.")
