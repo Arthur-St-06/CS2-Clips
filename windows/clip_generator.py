@@ -5,6 +5,8 @@ from pathlib import Path
 
 @dataclass
 class Job:
+    username: str
+
     cs2_exe: Path
     demo_path: Path
     hlae_exe: Path
@@ -12,7 +14,7 @@ class Job:
 
     tickrate: int = 64
     start_s: float = 40.0
-    duration_s: float = 5.0
+    duration_s: float = 60.0
 
     warmup_s: float = 1.5
 
@@ -62,6 +64,7 @@ def _pick_best_take(candidates: list[Path]) -> Path:
 
 
 def write_auto_record_cfg(
+    username: str,
     cfg_path: Path,
     start_tick: int,
     duration_ticks: int,
@@ -107,7 +110,7 @@ mirv_snd_timescale 1
 mirv_cmd addAtTick 1 "demo_gototick {start_tick}"
 
 // Set POV + open UI after jump:
-mirv_cmd addAtTick {start_tick} "spec_player Remag; demoui"
+mirv_cmd addAtTick {start_after_jump_tick} "spec_player {username}; demoui"
 
 // Start recording AFTER warmup:
 mirv_cmd addAtTick {start_after_jump_tick} "host_framerate {fps}; mirv_streams record start"
@@ -124,18 +127,18 @@ def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
     out_mp4 = take_dir / "out.mp4"
 
     cmd = [
-        job.ffmpeg_exe,
-        "-y",
+        job.ffmpeg_exe, "-y",
         "-framerate", str(job.fps),
         "-start_number", "0",
         "-i", "%05d.tga",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "18",
+        "-crf", "30",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(out_mp4),
     ]
+
 
     subprocess.run(cmd, cwd=take_dir, check=True)
     return out_mp4
@@ -156,6 +159,7 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
     cfg_path = cfg_dir / job.cfg_name
 
     write_auto_record_cfg(
+        username=job.username,
         cfg_path=cfg_path,
         start_tick=start_tick,
         duration_ticks=duration_ticks,
@@ -211,14 +215,15 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
 
 if __name__ == "__main__":
     job = Job(
+        username="Gknight",
         cs2_exe=Path(r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe"),
         demo_path=Path(r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\replays\match730_003792077342759714824_1663050728_392.dem"),
         hlae_exe=Path(r"C:\Program Files (x86)\HLAE\HLAE.exe"),
         hook_dll=Path(r"C:\Program Files (x86)\HLAE\x64\AfxHookSource2.dll"),
         out_dir=Path(r"D:\hlae_out"),
         start_s=40.0,
-        duration_s=5.0,
-        warmup_s=1.0,  # <-- 1 second wait before recording starts
+        duration_s=10.0,
+        warmup_s=2,
         fps=30,
         ffmpeg_exe="ffmpeg",
         cleanup_extra_takes=True,
