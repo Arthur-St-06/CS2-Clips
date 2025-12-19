@@ -1,12 +1,69 @@
-import subprocess
+import os
 import time
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Any
+
+import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
+
+# =========================
+# Shared auth
+# =========================
+TOKEN = os.environ.get("CLIP_TOKEN", "devtoken")
+
+# =========================
+# Static config (edit these)
+# =========================
+CS2_EXE = Path(os.environ.get(
+    "CS2_EXE",
+    r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe"
+))
+HLAE_EXE = Path(os.environ.get("HLAE_EXE", r"C:\Program Files (x86)\HLAE\HLAE.exe"))
+HOOK_DLL = Path(os.environ.get("HOOK_DLL", r"C:\Program Files (x86)\HLAE\x64\AfxHookSource2.dll"))
+OUT_DIR = Path(os.environ.get("HLAE_OUT_DIR", r"D:\hlae_out"))
+FFMPEG_EXE = os.environ.get("FFMPEG_EXE", "ffmpeg")
+
+TICKRATE = float(os.environ.get("TICKRATE", "64"))
+FPS = int(os.environ.get("FPS", "30"))
+WARMUP_S = float(os.environ.get("WARMUP_S", "2.0"))
+EXTRA_LAUNCH = os.environ.get("EXTRA_LAUNCH", "-steam -insecure -novid -nojoy -console")
+CLEANUP_EXTRA_TAKES = os.environ.get("CLEANUP_EXTRA_TAKES", "1") == "1"
+
+# Safety limits
+MIN_DURATION_S = float(os.environ.get("MIN_DURATION_S", "1.0"))
+MAX_DURATION_S = float(os.environ.get("MAX_DURATION_S", "60.0"))
+MIN_START_S = float(os.environ.get("MIN_START_S", "0.0"))
+MAX_START_S = float(os.environ.get("MAX_START_S", "99999.0"))
+
+# Demo registry: Ubuntu requests a demo_id, Windows maps it to a path.
+# Why: prevents arbitrary path exfiltration.
+DEMO_MAP: Dict[str, Path] = {
+    # Example:
+    "demo392": Path(r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\replays\match730_003792077342759714824_1663050728_392.dem"),
+}
+# Optional: allow adding more via env var "DEMO_DIR" (serve newest by id)
+DEMO_DIR = os.environ.get("DEMO_DIR")
+if DEMO_DIR:
+    ddir = Path(DEMO_DIR).resolve()
+    if ddir.exists():
+        for p in ddir.glob("*.dem"):
+            # use filename stem as id
+            DEMO_MAP[p.stem] = p
+
+
+# =========================
+# Your clip generator code (import or paste)
+# =========================
+# To keep this self-contained, paste your functions/classes here unchanged,
+# EXCEPT: remove the __main__ section. I’m including them as-is.
 
 @dataclass
 class Job:
     username: str
-
     cs2_exe: Path
     demo_path: Path
     hlae_exe: Path
@@ -17,15 +74,12 @@ class Job:
     duration_s: float = 60.0
 
     warmup_s: float = 1.5
-
     out_dir: Path = Path(r"D:\hlae_out")
     cfg_name: str = "auto_record.cfg"
-
     extra_launch: str = "-steam -insecure -novid -nojoy -console"
 
     fps: int = 30
     ffmpeg_exe: str = "ffmpeg"
-
     cleanup_extra_takes: bool = True
 
 
@@ -59,7 +113,6 @@ def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
 def _pick_best_take(candidates: list[Path]) -> Path:
     if not candidates:
         raise RuntimeError("No take folders found for this run.")
-    # Pick the take with the most frames (audio-only takes will have 0 frames)
     return max(candidates, key=lambda p: (_count_tga_frames(p), p.stat().st_mtime))
 
 
@@ -74,48 +127,25 @@ def write_auto_record_cfg(
     warmup_s: float,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Why: demo_gototick returns before the map/render is fully “settled” on some machines.
-    # Waiting warmup_s seconds (converted to ticks) avoids capturing loading frames.
     warmup_ticks = max(0, int(round(warmup_s * tickrate)))
     start_after_jump_tick = start_tick + warmup_ticks
     end_tick = start_after_jump_tick + duration_ticks
-
     out_path_cfg = out_dir.as_posix()
 
     cfg = f"""
 echo "=== auto_record (CS2): start_tick={start_tick} warmup_ticks={warmup_ticks} start_after_jump_tick={start_after_jump_tick} end_tick={end_tick} ==="
 mirv_cmd clear
-
-// Safety: ensure nothing is currently recording.
 mirv_streams record end
-
-// Enable screen capture (frames)
 mirv_streams record screen enabled 1
-
-// Disable audio capture (avoid extra audio-only takes)
 mirv_streams record startMovieWav 0
-
-// Output directory + FPS
 mirv_streams record name "{out_path_cfg}"
 mirv_streams record fps {fps}
-
-// TGA image sequence preset
 mirv_streams record screen settings afxClassic
-
 host_timescale 1
 mirv_snd_timescale 1
-
-// Jump as soon as demo starts ticking:
 mirv_cmd addAtTick 1 "demo_gototick {start_tick}"
-
-// Set POV + open UI after jump:
 mirv_cmd addAtTick {start_after_jump_tick} "spec_player {username}; demoui"
-
-// Start recording AFTER warmup:
 mirv_cmd addAtTick {start_after_jump_tick} "host_framerate {fps}; mirv_streams record start"
-
-// Stop recording:
 mirv_cmd addAtTick {end_tick} "mirv_streams record end; host_framerate 0; echo \\"=== auto_record done ===\\""
 """
     cfg_path.write_text(cfg.strip() + "\n", encoding="utf-8")
@@ -123,7 +153,6 @@ mirv_cmd addAtTick {end_tick} "mirv_streams record end; host_framerate 0; echo \
 
 def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
     _wait_for_frames(take_dir)
-
     out_mp4 = take_dir / "out.mp4"
 
     cmd = [
@@ -138,8 +167,6 @@ def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
         "-movflags", "+faststart",
         str(out_mp4),
     ]
-
-
     subprocess.run(cmd, cwd=take_dir, check=True)
     return out_mp4
 
@@ -187,16 +214,10 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
     if proc.returncode not in (0, None):
         raise RuntimeError(f"HLAE exited with code {proc.returncode}\n\n{out}")
 
-    print(out.strip() or "HLAE finished.")
-
     takes_after = _list_take_dirs(job.out_dir)
     new_takes = [p for p in takes_after if p.name not in takes_before]
-
     best_take = _pick_best_take(new_takes if new_takes else takes_after)
-    print(f"[convert] using take: {best_take} (frames={_count_tga_frames(best_take)})")
-
     mp4 = convert_take_to_mp4(job, best_take)
-    print(f"[convert] wrote {mp4}")
 
     if job.cleanup_extra_takes:
         for t in new_takes:
@@ -207,26 +228,110 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
                     for f in t.iterdir():
                         f.unlink()
                     t.rmdir()
-                    print(f"[cleanup] removed extra take: {t}")
                 except OSError:
                     pass
 
     return mp4
 
-if __name__ == "__main__":
+
+# =========================
+# Windows API
+# =========================
+app = FastAPI()
+
+
+def _require_token(x_token: str | None) -> None:
+    if x_token != TOKEN:
+        raise HTTPException(status_code=401, detail="Bad token")
+
+
+def _validate_float(name: str, v: Any, lo: float, hi: float) -> float:
+    try:
+        f = float(v)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{name} must be a number")
+    if not (lo <= f <= hi):
+        raise HTTPException(status_code=400, detail=f"{name} out of range [{lo}, {hi}]")
+    return f
+
+
+def _validate_username(u: Any) -> str:
+    if not isinstance(u, str) or not u.strip():
+        raise HTTPException(status_code=400, detail="username required")
+    # Why: avoid shell-ish characters. spec_player uses it directly.
+    safe = "".join(c for c in u.strip() if c.isalnum() or c in ("_", "-", " ", ".", "'"))
+    if not safe:
+        raise HTTPException(status_code=400, detail="bad username")
+    return safe
+
+
+def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
+    with mp4_path.open("rb") as f:
+        r = requests.post(
+            ubuntu_upload_url,
+            files={"file": (mp4_path.name, f, "video/mp4")},
+            headers={"X-Token": TOKEN},
+            timeout=600,
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+@app.get("/demos")
+def list_demos(x_token: str | None = Header(default=None)):
+    _require_token(x_token)
+    return {"ok": True, "demo_ids": sorted(DEMO_MAP.keys())}
+
+
+@app.post("/clip")
+def make_clip(payload: dict, x_token: str | None = Header(default=None)):
+    _require_token(x_token)
+
+    demo_id = payload.get("demo_id")
+    ubuntu_upload_url = payload.get("ubuntu_upload_url")
+    if not isinstance(demo_id, str) or demo_id not in DEMO_MAP:
+        raise HTTPException(status_code=400, detail="demo_id invalid or unknown")
+    if not isinstance(ubuntu_upload_url, str) or not ubuntu_upload_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="ubuntu_upload_url invalid")
+
+    username = _validate_username(payload.get("username"))
+    start_s = _validate_float("start_s", payload.get("start_s"), MIN_START_S, MAX_START_S)
+    duration_s = _validate_float("duration_s", payload.get("duration_s"), MIN_DURATION_S, MAX_DURATION_S)
+
     job = Job(
-        username="Gknight",
-        cs2_exe=Path(r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe"),
-        demo_path=Path(r"D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\replays\match730_003792077342759714824_1663050728_392.dem"),
-        hlae_exe=Path(r"C:\Program Files (x86)\HLAE\HLAE.exe"),
-        hook_dll=Path(r"C:\Program Files (x86)\HLAE\x64\AfxHookSource2.dll"),
-        out_dir=Path(r"D:\hlae_out"),
-        start_s=40.0,
-        duration_s=10.0,
-        warmup_s=2,
-        fps=30,
-        ffmpeg_exe="ffmpeg",
-        cleanup_extra_takes=True,
+        username=username,
+        cs2_exe=CS2_EXE,
+        demo_path=DEMO_MAP[demo_id],
+        hlae_exe=HLAE_EXE,
+        hook_dll=HOOK_DLL,
+        out_dir=OUT_DIR,
+        start_s=start_s,
+        duration_s=duration_s,
+        warmup_s=WARMUP_S,
+        fps=FPS,
+        ffmpeg_exe=FFMPEG_EXE,
+        cleanup_extra_takes=CLEANUP_EXTRA_TAKES,
+        tickrate=int(TICKRATE),
+        extra_launch=EXTRA_LAUNCH,
     )
 
-    launch_cs2_hlae_and_convert(job)
+    mp4 = launch_cs2_hlae_and_convert(job)
+    ubuntu_resp = _upload_to_ubuntu(ubuntu_upload_url, mp4)
+
+    return JSONResponse({
+        "ok": True,
+        "demo_id": demo_id,
+        "username": username,
+        "start_s": start_s,
+        "duration_s": duration_s,
+        "sent_mp4": str(mp4),
+        "ubuntu_response": ubuntu_resp,
+    })
+
+
+def main():
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("WIN_PORT", "8788")))
+
+
+if __name__ == "__main__":
+    main()
