@@ -6,3 +6,5 @@ server
 python ubuntu_node.py serve --host 0.0.0.0 --port 8787
 python ubuntu_node.py clip --demo-id demo392 --username Gknight --start-s 40 --duration-s 10 --ubuntu-base-url http://10.0.0.196:8787
 
+python demo_download.py "CSGO-FeAZd-XTaxw-QWXj9-cftoH-wcpmJ" ./demos --debug --gc-version 2000696
+

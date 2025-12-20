@@ -24,6 +24,7 @@ out_sprays/
 # demos (large binaries)
 *.dem
 *.dem.info
+*.dem.bz2
 
 # OS/editor
 .DS_Store
