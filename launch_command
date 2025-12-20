@@ -10,5 +10,5 @@ python ubuntu_node.py clip --demo-id demo392 --username Gknight --start-s 40 --d
 multiple clips
 python ubuntu_node.py clips --demo-id demo392 --username Remag --ubuntu-base-url http://10.0.0.196:8787 --clip 40 10 --clip 70.5 6 --clip 120 8
 
-python demo_download.py "CSGO-FeAZd-XTaxw-QWXj9-cftoH-wcpmJ" ./demos --debug --gc-version 2000696
-
+downloading all available demos
+python demo_download.py ./demos --debug --gc-version 2000696
