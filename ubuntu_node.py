@@ -2,6 +2,8 @@
 import os
 import sys
 from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
 import requests
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -41,36 +43,59 @@ async def upload(
     out = INBOX_DIR / fname
 
     with out.open("wb") as f:
-        while chunk := await file.read(1024 * 1024):
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
             f.write(chunk)
 
     return JSONResponse({"ok": True, "saved": str(out)})
 
 
 # =========================
-# Client: request clip
+# Client: request clip(s)
 # =========================
+def _require_windows_base_url() -> None:
+    if not WINDOWS_BASE_URL:
+        raise SystemExit("WINDOWS_BASE_URL not set (e.g. http://10.0.0.108:8788)")
+
+
 def request_clip(
     demo_id: str,
     username: str,
-    start_s: float,
-    duration_s: float,
     ubuntu_base_url: str,
+    start_s: float | None = None,
+    duration_s: float | None = None,
+    clips: List[Dict[str, float]] | None = None,
 ) -> dict:
-    if not WINDOWS_BASE_URL:
-        raise SystemExit("WINDOWS_BASE_URL not set")
+    """
+    If clips is provided, sends multi-clip request:
+      clips=[{"start_s": 40.0, "duration_s": 10.0}, ...]
+    Else sends single clip request with start_s/duration_s.
+    """
+    _require_windows_base_url()
 
     upload_url = ubuntu_base_url.rstrip("/") + "/upload"
 
+    payload: Dict[str, Any] = {
+        "demo_id": demo_id,
+        "username": username,
+        "ubuntu_upload_url": upload_url,
+    }
+
+    if clips is not None:
+        if not clips:
+            raise SystemExit("clips list is empty")
+        payload["clips"] = [{"start_s": float(c["start_s"]), "duration_s": float(c["duration_s"])} for c in clips]
+    else:
+        if start_s is None or duration_s is None:
+            raise SystemExit("start_s and duration_s are required for single clip mode")
+        payload["start_s"] = float(start_s)
+        payload["duration_s"] = float(duration_s)
+
     r = requests.post(
         WINDOWS_BASE_URL + "/clip",
-        json={
-            "demo_id": demo_id,
-            "username": username,
-            "start_s": float(start_s),
-            "duration_s": float(duration_s),
-            "ubuntu_upload_url": upload_url,
-        },
+        json=payload,
         headers={"X-Token": TOKEN},
         timeout=300,
     )
@@ -79,20 +104,64 @@ def request_clip(
 
 
 # =========================
+# CLI parsing helpers
+# =========================
+def _get_arg(flag: str) -> str:
+    if flag not in sys.argv:
+        raise SystemExit(f"Missing {flag}")
+    return sys.argv[sys.argv.index(flag) + 1]
+
+
+def _parse_multi_clips() -> List[Dict[str, float]]:
+    """
+    Parse repeated: --clip <start_s> <duration_s>
+    Example:
+      --clip 40 10 --clip 70.5 6
+    """
+    clips: List[Dict[str, float]] = []
+    i = 0
+    while i < len(sys.argv):
+        if sys.argv[i] == "--clip":
+            if i + 2 >= len(sys.argv):
+                raise SystemExit("Each --clip needs 2 values: --clip <start_s> <duration_s>")
+            try:
+                s = float(sys.argv[i + 1])
+                d = float(sys.argv[i + 2])
+            except ValueError:
+                raise SystemExit("Invalid number in --clip <start_s> <duration_s>")
+            clips.append({"start_s": s, "duration_s": d})
+            i += 3
+        else:
+            i += 1
+    if not clips:
+        raise SystemExit("No --clip entries provided")
+    return clips
+
+
+# =========================
 # CLI
 # =========================
 def main():
     """
-    Serve:
+    Serve (receiver):
       python ubuntu_node.py serve --host 0.0.0.0 --port 8787
 
-    Request clip:
+    Single clip request:
       python ubuntu_node.py clip \
         --demo-id demo392 \
         --username Remag \
         --start-s 40 \
         --duration-s 10 \
-        --ubuntu-base-url http://10.0.0.127:8787
+        --ubuntu-base-url http://10.0.0.196:8787
+
+    Multi-clip request (one Windows run, multiple segments):
+      python ubuntu_node.py clips \
+        --demo-id demo392 \
+        --username Remag \
+        --ubuntu-base-url http://10.0.0.196:8787 \
+        --clip 40 10 \
+        --clip 70.5 6 \
+        --clip 120 8
     """
     if len(sys.argv) < 2:
         print(main.__doc__)
@@ -104,21 +173,43 @@ def main():
         host = "0.0.0.0"
         port = 8787
         if "--host" in sys.argv:
-            host = sys.argv[sys.argv.index("--host") + 1]
+            host = _get_arg("--host")
         if "--port" in sys.argv:
-            port = int(sys.argv[sys.argv.index("--port") + 1])
+            port = int(_get_arg("--port"))
 
         uvicorn.run(app, host=host, port=port)
         return
 
     if cmd == "clip":
-        demo_id = sys.argv[sys.argv.index("--demo-id") + 1]
-        username = sys.argv[sys.argv.index("--username") + 1]
-        start_s = float(sys.argv[sys.argv.index("--start-s") + 1])
-        duration_s = float(sys.argv[sys.argv.index("--duration-s") + 1])
-        ubuntu_base_url = sys.argv[sys.argv.index("--ubuntu-base-url") + 1]
+        demo_id = _get_arg("--demo-id")
+        username = _get_arg("--username")
+        start_s = float(_get_arg("--start-s"))
+        duration_s = float(_get_arg("--duration-s"))
+        ubuntu_base_url = _get_arg("--ubuntu-base-url")
 
-        resp = request_clip(demo_id, username, start_s, duration_s, ubuntu_base_url)
+        resp = request_clip(
+            demo_id=demo_id,
+            username=username,
+            ubuntu_base_url=ubuntu_base_url,
+            start_s=start_s,
+            duration_s=duration_s,
+            clips=None,
+        )
+        print(resp)
+        return
+
+    if cmd == "clips":
+        demo_id = _get_arg("--demo-id")
+        username = _get_arg("--username")
+        ubuntu_base_url = _get_arg("--ubuntu-base-url")
+        clips = _parse_multi_clips()
+
+        resp = request_clip(
+            demo_id=demo_id,
+            username=username,
+            ubuntu_base_url=ubuntu_base_url,
+            clips=clips,
+        )
         print(resp)
         return
 

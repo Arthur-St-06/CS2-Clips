@@ -52,8 +52,11 @@ if DEMO_DIR:
 
 
 # =========================
-# Clip generator core
+# Your clip generator code (import or paste)
 # =========================
+# To keep this self-contained, paste your functions/classes here unchanged,
+# EXCEPT: remove the __main__ section. I’m including them as-is.
+
 @dataclass
 class Job:
     username: str
@@ -87,10 +90,8 @@ def _list_take_dirs(out_dir: Path) -> list[Path]:
         key=lambda p: p.stat().st_mtime,
     )
 
-
 def _count_tga_frames(take_dir: Path) -> int:
     return sum(1 for _ in take_dir.glob("*.tga"))
-
 
 def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
     t0 = time.time()
@@ -99,6 +100,47 @@ def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
             return
         time.sleep(0.25)
     raise RuntimeError(f"No .tga frames appeared in {take_dir} within {timeout_s:.0f}s")
+
+
+def _pick_best_take(candidates: list[Path]) -> Path:
+    if not candidates:
+        raise RuntimeError("No take folders found for this run.")
+    return max(candidates, key=lambda p: (_count_tga_frames(p), p.stat().st_mtime))
+
+
+def write_auto_record_cfg(
+    username: str,
+    cfg_path: Path,
+    start_tick: int,
+    duration_ticks: int,
+    out_dir: Path,
+    fps: int,
+    tickrate: int,
+    warmup_s: float,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    warmup_ticks = max(0, int(round(warmup_s * tickrate)))
+    start_after_jump_tick = start_tick + warmup_ticks
+    end_tick = start_after_jump_tick + duration_ticks
+    out_path_cfg = out_dir.as_posix()
+
+    cfg = f"""
+echo "=== auto_record (CS2): start_tick={start_tick} warmup_ticks={warmup_ticks} start_after_jump_tick={start_after_jump_tick} end_tick={end_tick} ==="
+mirv_cmd clear
+mirv_streams record end
+mirv_streams record screen enabled 1
+mirv_streams record startMovieWav 0
+mirv_streams record name "{out_path_cfg}"
+mirv_streams record fps {fps}
+mirv_streams record screen settings afxClassic
+host_timescale 1
+mirv_snd_timescale 1
+mirv_cmd addAtTick 1 "demo_gototick {start_tick}"
+mirv_cmd addAtTick {start_after_jump_tick} "spec_player {username}; demoui"
+mirv_cmd addAtTick {start_after_jump_tick} "host_framerate {fps}; mirv_streams record start"
+mirv_cmd addAtTick {end_tick} "mirv_streams record end; host_framerate 0; echo \\"=== auto_record done ===\\""
+"""
+    cfg_path.write_text(cfg.strip() + "\n", encoding="utf-8")
 
 
 def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
@@ -121,107 +163,7 @@ def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
     return out_mp4
 
 
-def _safe_filename(name: str) -> str:
-    name = name.replace("\\", "/").split("/")[-1]
-    safe = "".join(c for c in name if c.isalnum() or c in ("-", "_", ".", " ")).strip()
-    return safe or "clip.mp4"
-
-
-def write_auto_record_cfg_multi(
-    username: str,
-    cfg_path: Path,
-    segments: List[Tuple[int, int]],
-    out_dir: Path,
-    fps: int,
-    tickrate: int,
-    warmup_s: float,
-) -> None:
-    """
-    segments: list of (start_tick, end_tick), absolute demo ticks.
-
-    NEW BEHAVIOR:
-      After finishing a segment, we demo_gototick() to the next segment's pre-roll
-      so we DO NOT sit through long gaps.
-    """
-    if not segments:
-        raise RuntimeError("No segments provided")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    segments_sorted = sorted(segments, key=lambda x: x[0])
-
-    warmup_ticks = max(0, int(round(warmup_s * tickrate)))
-    first_start = segments_sorted[0][0]
-    jump_tick = max(1, first_start - warmup_ticks)
-
-    out_path_cfg = out_dir.as_posix()
-
-    seg_cmds: List[str] = []
-
-    for i, (s, e) in enumerate(segments_sorted):
-        # Make sure we are on the right POV at each segment.
-        seg_cmds.append(f'mirv_cmd addAtTick {s} "spec_player {username};"')
-
-        # Start recording
-        seg_cmds.append(f'mirv_cmd addAtTick {s} "host_framerate {fps}; mirv_streams record start"')
-
-        # End recording
-        seg_cmds.append(f'mirv_cmd addAtTick {e} "mirv_streams record end; host_framerate 0"')
-
-        # NEW: immediately skip to next segment pre-roll (if there is a next segment)
-        if i + 1 < len(segments_sorted):
-            next_start, _next_end = segments_sorted[i + 1]
-            next_jump = max(1, next_start - warmup_ticks)
-
-            # We schedule this 1 tick after ending the current clip
-            # Why: avoid overlapping with record end on the same tick.
-            seg_cmds.append(f'mirv_cmd addAtTick {e + 1} "demo_gototick {next_jump}"')
-
-            # Also re-assert POV right after the jump (some demos can reset spectator state)
-            seg_cmds.append(f'mirv_cmd addAtTick {max(2, next_jump + 1)} "spec_player {username};"')
-
-    # Quit shortly after the final segment ends.
-    last_end = segments_sorted[-1][1]
-    quit_tick = last_end + max(10, int(round(0.5 * tickrate)))
-
-    cfg = f"""
-echo "=== auto_record MULTI (CS2): segments={len(segments_sorted)} first_jump={jump_tick} warmup_ticks={warmup_ticks} ==="
-mirv_cmd clear
-
-// Safety: ensure not recording
-mirv_streams record end
-
-// Enable screen capture (frames)
-mirv_streams record screen enabled 1
-
-// Disable audio capture
-mirv_streams record startMovieWav 0
-
-// Output directory + FPS
-mirv_streams record name "{out_path_cfg}"
-mirv_streams record fps {fps}
-
-// TGA image sequence preset
-mirv_streams record screen settings afxClassic
-
-host_timescale 1
-mirv_snd_timescale 1
-
-// Initial jump near first segment:
-mirv_cmd addAtTick 1 "demo_gototick {jump_tick}"
-
-// Initial POV/UI after jump (not recording yet)
-mirv_cmd addAtTick {max(2, jump_tick + 1)} "spec_player {username}; demoui"
-
-// Segment schedule (record + skip gaps via demo_gototick):
-{chr(10).join(seg_cmds)}
-
-// Exit
-mirv_cmd addAtTick {quit_tick} "quit"
-"""
-    cfg_path.write_text(cfg.strip() + "\n", encoding="utf-8")
-
-
-def launch_cs2_hlae_and_convert_multi(job: Job, clips: List[dict]):
+def launch_cs2_hlae_and_convert(job: Job) -> Path:
     for p in [job.cs2_exe, job.demo_path, job.hlae_exe, job.hook_dll]:
         if not p.exists():
             raise FileNotFoundError(str(p))
@@ -308,12 +250,10 @@ def launch_cs2_hlae_and_convert_multi(job: Job, clips: List[dict]):
 
     return mp4s_sorted, sorted_indices
 
-
 # =========================
 # Windows API
 # =========================
 app = FastAPI()
-
 
 def _require_token(x_token: str | None) -> None:
     if x_token != TOKEN:
@@ -329,7 +269,6 @@ def _validate_float(name: str, v: Any, lo: float, hi: float) -> float:
         raise HTTPException(status_code=400, detail=f"{name} out of range [{lo}, {hi}]")
     return f
 
-
 def _validate_username(u: Any) -> str:
     if not isinstance(u, str) or not u.strip():
         raise HTTPException(status_code=400, detail="username required")
@@ -337,7 +276,6 @@ def _validate_username(u: Any) -> str:
     if not safe:
         raise HTTPException(status_code=400, detail="bad username")
     return safe
-
 
 def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
     with mp4_path.open("rb") as f:
@@ -351,30 +289,10 @@ def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
     return r.json()
 
 
-def _normalize_clips(payload: dict) -> List[dict]:
-    if isinstance(payload.get("clips"), list):
-        raw = payload["clips"]
-        if not raw:
-            raise HTTPException(status_code=400, detail="clips must be a non-empty list")
-        clips: List[dict] = []
-        for i, c in enumerate(raw):
-            if not isinstance(c, dict):
-                raise HTTPException(status_code=400, detail=f"clips[{i}] must be an object")
-            s = _validate_float(f"clips[{i}].start_s", c.get("start_s"), MIN_START_S, MAX_START_S)
-            d = _validate_float(f"clips[{i}].duration_s", c.get("duration_s"), MIN_DURATION_S, MAX_DURATION_S)
-            clips.append({"start_s": s, "duration_s": d, "req_index": i})
-        return clips
-
-    s = _validate_float("start_s", payload.get("start_s"), MIN_START_S, MAX_START_S)
-    d = _validate_float("duration_s", payload.get("duration_s"), MIN_DURATION_S, MAX_DURATION_S)
-    return [{"start_s": s, "duration_s": d, "req_index": 0}]
-
-
 @app.get("/demos")
 def list_demos(x_token: str | None = Header(default=None)):
     _require_token(x_token)
     return {"ok": True, "demo_ids": sorted(DEMO_MAP.keys())}
-
 
 @app.post("/clip")
 def make_clip(payload: dict, x_token: str | None = Header(default=None)):
@@ -448,10 +366,8 @@ def make_clip(payload: dict, x_token: str | None = Header(default=None)):
         "mode": "single_cs2_run_multi_segments_skip_gaps",
     })
 
-
 def main():
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("WIN_PORT", "8788")))
-
 
 if __name__ == "__main__":
     main()
