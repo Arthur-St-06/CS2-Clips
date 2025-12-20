@@ -54,13 +54,6 @@ if DEMO_DIR:
             # use filename stem as id
             DEMO_MAP[p.stem] = p
 
-
-# =========================
-# Your clip generator code (import or paste)
-# =========================
-# To keep this self-contained, paste your functions/classes here unchanged,
-# EXCEPT: remove the __main__ section. I’m including them as-is.
-
 @dataclass
 class Job:
     username: str
@@ -96,10 +89,8 @@ def _list_take_dirs(out_dir: Path) -> list[Path]:
         key=lambda p: p.stat().st_mtime,
     )
 
-
 def _count_tga_frames(take_dir: Path) -> int:
     return sum(1 for _ in take_dir.glob("*.tga"))
-
 
 def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
     t0 = time.time()
@@ -109,12 +100,10 @@ def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
         time.sleep(0.25)
     raise RuntimeError(f"No .tga frames appeared in {take_dir} within {timeout_s:.0f}s")
 
-
 def _pick_best_take(candidates: list[Path]) -> Path:
     if not candidates:
         raise RuntimeError("No take folders found for this run.")
     return max(candidates, key=lambda p: (_count_tga_frames(p), p.stat().st_mtime))
-
 
 def write_auto_record_cfg(
     username: str,
@@ -150,7 +139,6 @@ mirv_cmd addAtTick {end_tick} "mirv_streams record end; host_framerate 0; echo \
 """
     cfg_path.write_text(cfg.strip() + "\n", encoding="utf-8")
 
-
 def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
     _wait_for_frames(take_dir)
     out_mp4 = take_dir / "out.mp4"
@@ -169,7 +157,6 @@ def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
     ]
     subprocess.run(cmd, cwd=take_dir, check=True)
     return out_mp4
-
 
 def launch_cs2_hlae_and_convert(job: Job) -> Path:
     for p in [job.cs2_exe, job.demo_path, job.hlae_exe, job.hook_dll]:
@@ -233,12 +220,10 @@ def launch_cs2_hlae_and_convert(job: Job) -> Path:
 
     return mp4
 
-
 # =========================
 # Windows API
 # =========================
 app = FastAPI()
-
 
 def _require_token(x_token: str | None) -> None:
     if x_token != TOKEN:
@@ -254,7 +239,6 @@ def _validate_float(name: str, v: Any, lo: float, hi: float) -> float:
         raise HTTPException(status_code=400, detail=f"{name} out of range [{lo}, {hi}]")
     return f
 
-
 def _validate_username(u: Any) -> str:
     if not isinstance(u, str) or not u.strip():
         raise HTTPException(status_code=400, detail="username required")
@@ -263,7 +247,6 @@ def _validate_username(u: Any) -> str:
     if not safe:
         raise HTTPException(status_code=400, detail="bad username")
     return safe
-
 
 def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
     with mp4_path.open("rb") as f:
@@ -276,12 +259,10 @@ def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
     r.raise_for_status()
     return r.json()
 
-
 @app.get("/demos")
 def list_demos(x_token: str | None = Header(default=None)):
     _require_token(x_token)
     return {"ok": True, "demo_ids": sorted(DEMO_MAP.keys())}
-
 
 @app.post("/clip")
 def make_clip(payload: dict, x_token: str | None = Header(default=None)):
@@ -328,10 +309,8 @@ def make_clip(payload: dict, x_token: str | None = Header(default=None)):
         "ubuntu_response": ubuntu_resp,
     })
 
-
 def main():
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("WIN_PORT", "8788")))
-
 
 if __name__ == "__main__":
     main()

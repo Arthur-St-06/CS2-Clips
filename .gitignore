@@ -18,6 +18,8 @@ out_sprays/
 *.mkv
 *.log
 *.txt
+.env
+*.env
 
 # demos (large binaries)
 *.dem
