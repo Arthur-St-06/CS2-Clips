@@ -1,9 +1,10 @@
 import os
 import time
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -38,6 +39,12 @@ MIN_DURATION_S = float(os.environ.get("MIN_DURATION_S", "1.0"))
 MAX_DURATION_S = float(os.environ.get("MAX_DURATION_S", "60.0"))
 MIN_START_S = float(os.environ.get("MIN_START_S", "0.0"))
 MAX_START_S = float(os.environ.get("MAX_START_S", "99999.0"))
+
+# Streaming/monitoring tuning
+TAKE_POLL_S = float(os.environ.get("TAKE_POLL_S", "0.25"))
+WAIT_FRAMES_TIMEOUT_S = float(os.environ.get("WAIT_FRAMES_TIMEOUT_S", "30.0"))
+WAIT_STABLE_TIMEOUT_S = float(os.environ.get("WAIT_STABLE_TIMEOUT_S", "120.0"))
+STABLE_WINDOW_S = float(os.environ.get("STABLE_WINDOW_S", "1.25"))
 
 # Demo registry (safe)
 DEMO_MAP: Dict[str, Path] = {
@@ -92,17 +99,61 @@ def _count_tga_frames(take_dir: Path) -> int:
     return sum(1 for _ in take_dir.glob("*.tga"))
 
 
-def _wait_for_frames(take_dir: Path, timeout_s: float = 30.0) -> None:
+def _wait_for_frames(take_dir: Path, timeout_s: float = WAIT_FRAMES_TIMEOUT_S) -> None:
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         if any(take_dir.glob("*.tga")):
             return
-        time.sleep(0.25)
+        time.sleep(TAKE_POLL_S)
     raise RuntimeError(f"No .tga frames appeared in {take_dir} within {timeout_s:.0f}s")
 
 
+def _latest_tga_mtime_and_count(take_dir: Path) -> Tuple[int, float]:
+    cnt = 0
+    latest = 0.0
+    for p in take_dir.glob("*.tga"):
+        cnt += 1
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if mt > latest:
+            latest = mt
+    return cnt, latest
+
+
+def _wait_for_frames_stable(
+    take_dir: Path,
+    stable_window_s: float = STABLE_WINDOW_S,
+    timeout_s: float = WAIT_STABLE_TIMEOUT_S,
+) -> None:
+    """
+    Why: ffmpeg must not read while HLAE is still writing frames.
+    Strategy: wait until (frame_count, latest_frame_mtime) stops changing for stable_window_s.
+    """
+    _wait_for_frames(take_dir, timeout_s=min(timeout_s, WAIT_FRAMES_TIMEOUT_S))
+
+    t0 = time.time()
+    last_cnt, last_mt = _latest_tga_mtime_and_count(take_dir)
+    stable_since = time.time()
+
+    while time.time() - t0 < timeout_s:
+        time.sleep(TAKE_POLL_S)
+
+        cnt, mt = _latest_tga_mtime_and_count(take_dir)
+
+        if cnt == last_cnt and mt == last_mt and cnt > 0:
+            if time.time() - stable_since >= stable_window_s:
+                return
+        else:
+            last_cnt, last_mt = cnt, mt
+            stable_since = time.time()
+
+    raise RuntimeError(f"Frames in {take_dir} did not stabilize within {timeout_s:.0f}s")
+
+
 def convert_take_to_mp4(job: Job, take_dir: Path) -> Path:
-    _wait_for_frames(take_dir)
+    _wait_for_frames_stable(take_dir)
     out_mp4 = take_dir / "out.mp4"
 
     cmd = [
@@ -136,13 +187,6 @@ def write_auto_record_cfg_multi(
     tickrate: int,
     warmup_s: float,
 ) -> None:
-    """
-    segments: list of (start_tick, end_tick), absolute demo ticks.
-
-    NEW BEHAVIOR:
-      After finishing a segment, we demo_gototick() to the next segment's pre-roll
-      so we DO NOT sit through long gaps.
-    """
     if not segments:
         raise RuntimeError("No segments provided")
 
@@ -158,28 +202,16 @@ def write_auto_record_cfg_multi(
     seg_cmds: List[str] = []
 
     for i, (s, e) in enumerate(segments_sorted):
-        # Make sure we are on the right POV at each segment.
         seg_cmds.append(f'mirv_cmd addAtTick {s} "spec_player {username};"')
-
-        # Start recording
         seg_cmds.append(f'mirv_cmd addAtTick {s} "host_framerate {fps}; mirv_streams record start"')
-
-        # End recording
         seg_cmds.append(f'mirv_cmd addAtTick {e} "mirv_streams record end; host_framerate 0"')
 
-        # NEW: immediately skip to next segment pre-roll (if there is a next segment)
         if i + 1 < len(segments_sorted):
-            next_start, _next_end = segments_sorted[i + 1]
+            next_start, _ = segments_sorted[i + 1]
             next_jump = max(1, next_start - warmup_ticks)
-
-            # We schedule this 1 tick after ending the current clip
-            # Why: avoid overlapping with record end on the same tick.
             seg_cmds.append(f'mirv_cmd addAtTick {e + 1} "demo_gototick {next_jump}"')
-
-            # Also re-assert POV right after the jump (some demos can reset spectator state)
             seg_cmds.append(f'mirv_cmd addAtTick {max(2, next_jump + 1)} "spec_player {username};"')
 
-    # Quit shortly after the final segment ends.
     last_end = segments_sorted[-1][1]
     quit_tick = last_end + max(10, int(round(0.5 * tickrate)))
 
@@ -187,47 +219,108 @@ def write_auto_record_cfg_multi(
 echo "=== auto_record MULTI (CS2): segments={len(segments_sorted)} first_jump={jump_tick} warmup_ticks={warmup_ticks} ==="
 mirv_cmd clear
 
-// Safety: ensure not recording
 mirv_streams record end
 
-// Enable screen capture (frames)
 mirv_streams record screen enabled 1
-
-// Disable audio capture
 mirv_streams record startMovieWav 0
 
-// Output directory + FPS
 mirv_streams record name "{out_path_cfg}"
 mirv_streams record fps {fps}
 
-// TGA image sequence preset
 mirv_streams record screen settings afxClassic
 
 host_timescale 1
 mirv_snd_timescale 1
 
-// Initial jump near first segment:
 mirv_cmd addAtTick 1 "demo_gototick {jump_tick}"
-
-// Initial POV/UI after jump (not recording yet)
 mirv_cmd addAtTick {max(2, jump_tick + 1)} "spec_player {username}; demoui"
 
-// Segment schedule (record + skip gaps via demo_gototick):
 {chr(10).join(seg_cmds)}
 
-// Exit
 mirv_cmd addAtTick {quit_tick} "quit"
 """
     cfg_path.write_text(cfg.strip() + "\n", encoding="utf-8")
 
 
-def launch_cs2_hlae_and_convert_multi(job: Job, clips: List[dict]):
+def _start_hlae(job: Job) -> subprocess.Popen:
+    cmdline = f'{job.extra_launch} +playdemo "{job.demo_path}" +exec {job.cfg_name}'
+    cmd = [
+        str(job.hlae_exe),
+        "-customLoader",
+        "-noGui",
+        "-autoStart",
+        "-hookDllPath", str(job.hook_dll),
+        "-programPath", str(job.cs2_exe),
+        "-cmdLine", cmdline,
+    ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def _collect_proc_output(proc: subprocess.Popen, buf: List[str]) -> None:
+    try:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            buf.append(line)
+    except Exception:
+        pass
+
+
+def _wait_next_new_take(
+    out_dir: Path,
+    known: set[str],
+    seen_in_this_run: set[str],
+    timeout_s: float,
+) -> Path:
+    """
+    Why: we want to process takes as soon as they appear.
+    Chooses the oldest (by mtime) among new unseen take dirs.
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        takes = _list_take_dirs(out_dir)
+        candidates = [t for t in takes if t.name not in known and t.name not in seen_in_this_run]
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime)
+            return candidates[0]
+        time.sleep(TAKE_POLL_S)
+    raise RuntimeError(f"Timed out waiting for next take folder in {out_dir}")
+
+
+def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
+    with mp4_path.open("rb") as f:
+        r = requests.post(
+            ubuntu_upload_url,
+            files={"file": (mp4_path.name, f, "video/mp4")},
+            headers={"X-Token": TOKEN},
+            timeout=600,
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+def launch_cs2_hlae_convert_and_upload_streaming(
+    job: Job,
+    demo_id: str,
+    ubuntu_upload_url: str,
+    clips: List[dict],
+) -> List[dict]:
+    """
+    NEW BEHAVIOR:
+    - While HLAE is still running and creating take folders, we:
+      (1) detect each new take folder as it appears
+      (2) wait for its frames to stop changing
+      (3) ffmpeg it to mp4
+      (4) rename + upload immediately
+    The HTTP response still returns at the end, but Ubuntu starts receiving clips ASAP.
+    """
     for p in [job.cs2_exe, job.demo_path, job.hlae_exe, job.hook_dll]:
         if not p.exists():
             raise FileNotFoundError(str(p))
 
     subprocess.run([job.ffmpeg_exe, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
+    # Build segment ticks and sort by start tick
     segments: List[Tuple[int, int]] = []
     for c in clips:
         start_s = float(c["start_s"])
@@ -256,57 +349,93 @@ def launch_cs2_hlae_and_convert_multi(job: Job, clips: List[dict]):
     )
 
     takes_before = {p.name for p in _list_take_dirs(job.out_dir)}
+    seen_in_this_run: set[str] = set()
+    chosen_takes: List[Path] = []
+    results_by_req_index: Dict[int, dict] = {}
 
-    cmdline = f'{job.extra_launch} +playdemo "{job.demo_path}" +exec {job.cfg_name}'
-    cmd = [
-        str(job.hlae_exe),
-        "-customLoader",
-        "-noGui",
-        "-autoStart",
-        "-hookDllPath", str(job.hook_dll),
-        "-programPath", str(job.cs2_exe),
-        "-cmdLine", cmdline,
-    ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    out = proc.communicate()[0] or ""
-    if proc.returncode not in (0, None):
-        raise RuntimeError(f"HLAE exited with code {proc.returncode}\n\n{out}")
-
-    takes_after = _list_take_dirs(job.out_dir)
-    new_takes = [p for p in takes_after if p.name not in takes_before]
-
-    new_takes_with_frames = [t for t in new_takes if _count_tga_frames(t) > 0]
-    new_takes_with_frames.sort(key=lambda p: p.stat().st_mtime)
+    proc = _start_hlae(job)
+    out_buf: List[str] = []
+    t_out = threading.Thread(target=_collect_proc_output, args=(proc, out_buf), daemon=True)
+    t_out.start()
 
     expected = len(segments_sorted)
-    if len(new_takes_with_frames) < expected:
-        raise RuntimeError(
-            f"Expected {expected} take folders with frames, but got {len(new_takes_with_frames)}.\n"
-            f"All new takes: {[t.name for t in new_takes]}\n"
-            f"With frames: {[t.name for t in new_takes_with_frames]}"
-        )
 
-    chosen = new_takes_with_frames[:expected]
+    # A reasonable upper bound timeout per take: warmup + duration + some slack + gaps (we skip gaps)
+    per_take_timeout = max(60.0, WAIT_STABLE_TIMEOUT_S + 30.0)
 
-    mp4s_sorted: List[Path] = []
-    for take_dir in chosen:
-        mp4 = convert_take_to_mp4(job, take_dir)
-        mp4s_sorted.append(mp4)
+    try:
+        for out_i in range(expected):
+            take_dir = _wait_next_new_take(
+                out_dir=job.out_dir,
+                known=takes_before,
+                seen_in_this_run=seen_in_this_run,
+                timeout_s=per_take_timeout,
+            )
+            seen_in_this_run.add(take_dir.name)
+            chosen_takes.append(take_dir)
 
+            # Convert as soon as recording for this take finishes (frames stabilize)
+            mp4_path = convert_take_to_mp4(job, take_dir)
+
+            # Map this take (in appearance order) to the clip segment order
+            clip = clips[sorted_indices[out_i]]
+            start_s = float(clip["start_s"])
+            duration_s = float(clip["duration_s"])
+            req_index = int(clip["req_index"])
+
+            new_name = _safe_filename(f"{demo_id}_{job.username}_{req_index}_{start_s:.3f}s_{duration_s:.3f}s.mp4")
+            final_mp4 = mp4_path.with_name(new_name)
+            try:
+                if final_mp4.exists():
+                    final_mp4.unlink()
+                mp4_path.rename(final_mp4)
+            except OSError:
+                final_mp4 = mp4_path
+
+            # Upload immediately (this is the key change)
+            ubuntu_resp = _upload_to_ubuntu(ubuntu_upload_url, final_mp4)
+
+            results_by_req_index[req_index] = {
+                "req_index": req_index,
+                "start_s": start_s,
+                "duration_s": duration_s,
+                "sent_mp4": str(final_mp4),
+                "ubuntu_response": ubuntu_resp,
+            }
+
+        # Wait for HLAE to end (should quit from cfg)
+        rc = proc.wait(timeout=120)
+        if rc != 0:
+            out = "".join(out_buf[-4000:])  # keep tail if huge
+            raise RuntimeError(f"HLAE exited with code {rc}\n\n{out}")
+
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    # Optional cleanup: remove extra empty takes that appeared
     if job.cleanup_extra_takes:
-        for t in new_takes:
-            if t in chosen:
-                continue
-            if _count_tga_frames(t) == 0:
-                try:
-                    for f in t.iterdir():
-                        f.unlink()
-                    t.rmdir()
-                except OSError:
-                    pass
+        try:
+            takes_after = _list_take_dirs(job.out_dir)
+            new_takes = [p for p in takes_after if p.name not in takes_before]
+            for t in new_takes:
+                if t in chosen_takes:
+                    continue
+                if _count_tga_frames(t) == 0:
+                    try:
+                        for f in t.iterdir():
+                            f.unlink()
+                        t.rmdir()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
-    return mp4s_sorted, sorted_indices
+    ordered_results = [results_by_req_index[i] for i in sorted(results_by_req_index.keys())]
+    return ordered_results
 
 
 # =========================
@@ -315,7 +444,7 @@ def launch_cs2_hlae_and_convert_multi(job: Job, clips: List[dict]):
 app = FastAPI()
 
 
-def _require_token(x_token: str | None) -> None:
+def _require_token(x_token: Optional[str]) -> None:
     if x_token != TOKEN:
         raise HTTPException(status_code=401, detail="Bad token")
 
@@ -339,18 +468,6 @@ def _validate_username(u: Any) -> str:
     return safe
 
 
-def _upload_to_ubuntu(ubuntu_upload_url: str, mp4_path: Path) -> dict:
-    with mp4_path.open("rb") as f:
-        r = requests.post(
-            ubuntu_upload_url,
-            files={"file": (mp4_path.name, f, "video/mp4")},
-            headers={"X-Token": TOKEN},
-            timeout=600,
-        )
-    r.raise_for_status()
-    return r.json()
-
-
 def _normalize_clips(payload: dict) -> List[dict]:
     if isinstance(payload.get("clips"), list):
         raw = payload["clips"]
@@ -371,13 +488,13 @@ def _normalize_clips(payload: dict) -> List[dict]:
 
 
 @app.get("/demos")
-def list_demos(x_token: str | None = Header(default=None)):
+def list_demos(x_token: Optional[str] = Header(default=None)):
     _require_token(x_token)
     return {"ok": True, "demo_ids": sorted(DEMO_MAP.keys())}
 
 
 @app.post("/clip")
-def make_clip(payload: dict, x_token: str | None = Header(default=None)):
+def make_clip(payload: dict, x_token: Optional[str] = Header(default=None)):
     _require_token(x_token)
 
     demo_id = payload.get("demo_id")
@@ -409,35 +526,13 @@ def make_clip(payload: dict, x_token: str | None = Header(default=None)):
         cfg_name=cfg_name,
     )
 
-    mp4s_sorted, sorted_indices = launch_cs2_hlae_and_convert_multi(job, clips)
-
-    results_by_req_index = {}
-    for out_i, mp4_path in enumerate(mp4s_sorted):
-        clip = clips[sorted_indices[out_i]]
-        start_s = float(clip["start_s"])
-        duration_s = float(clip["duration_s"])
-        req_index = int(clip["req_index"])
-
-        new_name = _safe_filename(f"{demo_id}_{username}_{req_index}_{start_s:.3f}s_{duration_s:.3f}s.mp4")
-        final_mp4 = mp4_path.with_name(new_name)
-        try:
-            if final_mp4.exists():
-                final_mp4.unlink()
-            mp4_path.rename(final_mp4)
-        except OSError:
-            final_mp4 = mp4_path
-
-        ubuntu_resp = _upload_to_ubuntu(ubuntu_upload_url, final_mp4)
-
-        results_by_req_index[req_index] = {
-            "req_index": req_index,
-            "start_s": start_s,
-            "duration_s": duration_s,
-            "sent_mp4": str(final_mp4),
-            "ubuntu_response": ubuntu_resp,
-        }
-
-    ordered_results = [results_by_req_index[i] for i in sorted(results_by_req_index.keys())]
+    # NEW: convert + upload in a streaming manner (uploads happen ASAP)
+    ordered_results = launch_cs2_hlae_convert_and_upload_streaming(
+        job=job,
+        demo_id=demo_id,
+        ubuntu_upload_url=ubuntu_upload_url,
+        clips=clips,
+    )
 
     return JSONResponse({
         "ok": True,
@@ -445,7 +540,7 @@ def make_clip(payload: dict, x_token: str | None = Header(default=None)):
         "username": username,
         "clips_count": len(ordered_results),
         "results": ordered_results,
-        "mode": "single_cs2_run_multi_segments_skip_gaps",
+        "mode": "single_cs2_run_multi_segments_skip_gaps_stream_upload",
     })
 
 

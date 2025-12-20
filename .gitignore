@@ -8,6 +8,7 @@ build/
 myenv/
 .venv/
 venv/
+windows/clip_server/
 
 # outputs
 out_sprays/
