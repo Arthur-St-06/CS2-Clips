@@ -24,8 +24,43 @@ def main():
 
     bursts = pd.read_parquet(bursts_path).copy()
 
+    # Check if bursts is empty or missing required columns
+    if bursts.empty:
+        print("No bursts found in bursts.parquet")
+        # Create empty output file
+        empty_df = pd.DataFrame(columns=[
+            "player", "steamid", "weapon", "start_tick", "end_tick",
+            "bullets", "duration_s", "death_tick", "start_s", "end_s",
+            "death_s", "time_to_death_after_burst_s"
+        ])
+        empty_df.to_parquet(out / "overspray_candidates.parquet")
+        print(f"Spray-like bursts: 0")
+        print("Overspray candidates (die soon, no kill): 0")
+        print(f"Saved: {out/'overspray_candidates.parquet'} (empty)")
+        return
+
+    # Validate required columns
+    required_cols = ["bullets", "duration_s", "player", "start_tick", "end_tick", "steamid", "weapon"]
+    missing = [c for c in required_cols if c not in bursts.columns]
+    if missing:
+        raise ValueError(f"bursts.parquet missing required columns: {missing}")
+
     # Filter to spray-like bursts
     bursts = bursts[(bursts["bullets"] >= args.min_bullets) & (bursts["duration_s"] >= args.min_duration_s)].copy()
+    
+    if bursts.empty:
+        print(f"No bursts with >= {args.min_bullets} bullets and >= {args.min_duration_s}s duration")
+        empty_df = pd.DataFrame(columns=[
+            "player", "steamid", "weapon", "start_tick", "end_tick",
+            "bullets", "duration_s", "death_tick", "start_s", "end_s",
+            "death_s", "time_to_death_after_burst_s"
+        ])
+        empty_df.to_parquet(out / "overspray_candidates.parquet")
+        print(f"Spray-like bursts: 0")
+        print("Overspray candidates (die soon, no kill): 0")
+        print(f"Saved: {out/'overspray_candidates.parquet'} (empty)")
+        return
+    
     bursts = bursts.sort_values(["player", "end_tick"]).reset_index(drop=True)
 
     parser = DemoParser(args.demo)

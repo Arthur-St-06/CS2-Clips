@@ -12,3 +12,6 @@ python ubuntu_node.py clips --demo-id demo392 --username Remag --ubuntu-base-url
 
 downloading all available demos
 python demo_download.py ./demos --debug --gc-version 2000696
+
+demo server
+python demo_server.py serve --demo-dir ./demos --port 8789

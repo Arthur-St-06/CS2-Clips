@@ -12,8 +12,8 @@ import uvicorn
 # =========================
 # Config
 # =========================
-TOKEN = os.environ.get("CLIP_TOKEN", "devtoken")
-WINDOWS_BASE_URL = os.environ.get("WINDOWS_BASE_URL", "").rstrip("/")
+TOKEN = os.environ.get("CLIP_TOKEN", "token")
+WINDOWS_BASE_URL = os.environ.get("WINDOWS_BASE_URL", "http://10.0.0.108:8788").rstrip("/")
 
 INBOX_DIR = Path("./inbox").resolve()
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
