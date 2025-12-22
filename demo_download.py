@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# steam_login.py
+# demo_download.py
 
 # WHY: Must be first. If urllib3/ssl imports happen before this, you can get recursion/hangs.
 from gevent import monkey
