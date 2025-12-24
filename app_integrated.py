@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-app.py - CS2 Coach Web UI with auto-starting pipeline
+app.py - CS2 Coach Web UI
 
-Features:
-- Auto-starts data gathering when page opens
-- Shows demo info as soon as available
-- Shows clips as they arrive
-- Auto-refreshes to show progress
+Shows daemon status, recent demos, and clips as they arrive.
 
 Usage:
-    streamlit run app.py
+    streamlit run app_integrated.py
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -52,48 +46,19 @@ DEFAULT_CONFIG = {
 # =========================
 
 def get_status_path() -> Path:
-    return Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve() / "pipeline_status.json"
+    return Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve() / "daemon_status.json"
 
 
-def read_pipeline_status() -> dict:
-    """Read pipeline status from disk"""
+def read_daemon_status() -> dict:
+    """Read daemon status from disk"""
     status_path = get_status_path()
     if not status_path.exists():
-        return {"phase": "not_started", "message": "Pipeline not started yet"}
+        return {"running": False, "phase": "not_started", "message": "Daemon not started"}
     
     try:
         return json.loads(status_path.read_text())
     except Exception as e:
-        return {"phase": "error", "message": f"Failed to read status: {e}"}
-
-
-def is_pipeline_running() -> bool:
-    """Check if pipeline is currently running"""
-    status = read_pipeline_status()
-    phase = status.get("phase", "")
-    return phase not in ["not_started", "complete", "error", "idle"]
-
-
-def get_lock_path() -> Path:
-    return Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve() / "pipeline.lock"
-
-
-def is_pipeline_locked() -> bool:
-    """Check if pipeline lock exists (another instance running)"""
-    lock = get_lock_path()
-    if not lock.exists():
-        return False
-    
-    # Check if lock is stale (older than 1 hour)
-    try:
-        age = time.time() - lock.stat().st_mtime
-        if age > 3600:
-            lock.unlink()
-            return False
-    except Exception:
-        pass
-    
-    return True
+        return {"running": False, "phase": "error", "message": f"Failed to read status: {e}"}
 
 
 def get_daemon_status() -> dict:
@@ -104,62 +69,6 @@ def get_daemon_status() -> dict:
         return r.json()
     except Exception:
         return {"running": False, "error": "Daemon not reachable"}
-
-
-# =========================
-# Pipeline control
-# =========================
-
-def start_pipeline_background():
-    """Start the pipeline in a background process"""
-    if is_pipeline_locked():
-        return False
-    
-    # Create lock
-    lock = get_lock_path()
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text(str(os.getpid()))
-    
-    demo_dir = Path(DEFAULT_CONFIG["DEMO_DIR"]).expanduser().resolve()
-    out_dir = Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve()
-    inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
-    
-    cmd = [
-        "python", "pipeline_runner.py",
-        "--player", DEFAULT_CONFIG["PLAYER_NAME"],
-        "--demo-dir", str(demo_dir),
-        "--out", str(out_dir),
-        "--inbox", str(inbox_dir),
-        "--windows-url", DEFAULT_CONFIG["WINDOWS_URL"],
-        "--ubuntu-url", DEFAULT_CONFIG["UBUNTU_URL"],
-    ]
-    
-    # Start subprocess
-    log_path = out_dir / "pipeline.log"
-    with open(log_path, "w") as log_file:
-        subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    
-    return True
-
-
-def reset_pipeline():
-    """Reset pipeline status and clear lock"""
-    try:
-        get_lock_path().unlink(missing_ok=True)
-    except Exception:
-        pass
-    
-    try:
-        status_path = get_status_path()
-        if status_path.exists():
-            status_path.unlink()
-    except Exception:
-        pass
 
 
 # =========================
@@ -234,7 +143,7 @@ def show_demos_table(demos_info: list):
     display_cols = ["map", "played_at", "size_mb"]
     display_cols = [c for c in display_cols if c in df.columns]
     
-    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+    st.dataframe(df[display_cols], width='stretch', hide_index=True)
 
 
 def show_clips_grid(clips_info: list, inbox_dir: Path):
@@ -294,18 +203,16 @@ with st.sidebar:
     
     st.divider()
     
-    # Daemon status
-    st.header("📡 Demo Daemon")
+    # Daemon controls
+    st.header("📡 Daemon Controls")
     daemon_status = get_daemon_status()
     
     if daemon_status.get("running"):
         st.success("✅ Daemon running")
-        st.caption(f"Last check: {daemon_status.get('last_check', 'Never')[:19]}")
-        st.caption(f"Total downloaded: {daemon_status.get('total_downloaded', 0)}")
         
-        if st.button("🔄 Check for new demos", use_container_width=True):
+        if st.button("🔄 Check for new demos", width='stretch'):
             try:
-                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/check", timeout=30)
+                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/check", timeout=60)
                 r.raise_for_status()
                 result = r.json()
                 if result.get("new_demos", 0) > 0:
@@ -316,117 +223,164 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                 st.error(f"Check failed: {e}")
+        
+        if st.button("🔄 Reprocess existing demos", width='stretch'):
+            try:
+                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/process", timeout=300)
+                r.raise_for_status()
+                st.success("Processing started!")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Process failed: {e}")
     else:
         st.warning("⚠️ Daemon not running")
-        st.caption("Start with: `python demo_daemon.py`")
+        st.code(f"python demo_daemon.py --player {DEFAULT_CONFIG['PLAYER_NAME']}", language="bash")
     
     st.divider()
     
-    st.caption("To change settings, edit environment variables or .env file")
+    if st.button("🔄 Refresh", width='stretch'):
+        st.rerun()
     
     st.divider()
-    
-    # Manual controls
-    st.header("🔧 Controls")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔄 Refresh", use_container_width=True):
-            st.rerun()
-    
-    with col2:
-        if st.button("🗑️ Reset", use_container_width=True):
-            reset_pipeline()
-            st.success("Pipeline reset!")
-            st.rerun()
-    
-    if st.button("▶️ Start Pipeline", use_container_width=True, type="primary"):
-        if start_pipeline_background():
-            st.success("Pipeline started!")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.warning("Pipeline already running")
+    st.caption("Edit .env file to change settings")
 
 # Read current status
-status = read_pipeline_status()
+status = read_daemon_status()
 phase = status.get("phase", "not_started")
-
-# Auto-start pipeline if not running and not complete
-if phase == "not_started" and not is_pipeline_locked():
-    st.info("🚀 Starting pipeline automatically...")
-    if start_pipeline_background():
-        time.sleep(2)
-        st.rerun()
+is_running = status.get("running", False)
 
 # Main content
 st.divider()
 
 # Status section
-st.header("📊 Pipeline Status")
-show_phase_progress(status)
+st.header("📊 Status")
+
+# Show daemon status
+if is_running:
+    col_status, col_phase = st.columns([1, 3])
+    with col_status:
+        if status.get("gc_ready"):
+            st.success("🟢 Connected")
+        elif status.get("steam_connected"):
+            st.warning("🟡 Steam OK, GC pending")
+        else:
+            st.error("🔴 Connecting...")
+    with col_phase:
+        st.write(f"**{phase.title()}**: {status.get('message', '')}")
+else:
+    st.warning("⚠️ Daemon not running. Start with: `python demo_daemon.py --player Remag`")
 
 # Stats row
-if status.get("demos_indexed", 0) > 0 or status.get("clips_received", 0) > 0:
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Demos Indexed", status.get("demos_indexed", 0))
-    col2.metric("Demos Analyzed", status.get("demos_analyzed", 0))
-    col3.metric("Clips Requested", status.get("clips_requested", 0))
-    col4.metric("Clips Received", status.get("clips_received", 0))
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Demos Downloaded", status.get("total_downloaded", 0))
+col2.metric("Demos Analyzed", status.get("demos_analyzed", 0))
+
+# Show pending vs requested based on phase
+pending_clips = status.get("pending_clips", 0)
+clips_requested = status.get("clips_requested", 0)
+
+if pending_clips > 0 and not status.get("batch_sent"):
+    col3.metric("Clips Pending", pending_clips)
+else:
+    col3.metric("Clips Requested", clips_requested)
+
+col4.metric("Clips Received", status.get("clips_received", 0))
+
+# Show pending batch info
+if status.get("pending_demos", 0) > 0:
+    col_info, col_btn = st.columns([3, 1])
+    with col_info:
+        st.info(f"📦 Batch pending: {status.get('pending_demos', 0)} demos, {pending_clips} clips (will send when all demos downloaded)")
+    with col_btn:
+        if st.button("Send Now", type="primary"):
+            try:
+                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/send_batch", timeout=60)
+                r.raise_for_status()
+                st.success("Batch sent!")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
+if status.get("last_check"):
+    st.caption(f"Last check: {status.get('last_check', '')[:19]}")
 
 st.divider()
 
 # Tabs for different views
-tab_clips, tab_demos, tab_log = st.tabs(["📹 Clips", "🎮 Demos", "📋 Log"])
+tab_clips, tab_demos, tab_log = st.tabs(["📹 Clips", "🎮 Demos", "📋 Status"])
 
 with tab_clips:
-    st.header("Received Clips")
+    st.header("Recent Clips")
     
     inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
-    clips_info = status.get("clips_info", [])
+    recent_clips = status.get("recent_clips", [])
     
-    show_clips_grid(clips_info, inbox_dir)
+    if recent_clips:
+        st.write(f"**{len(recent_clips)} recent clips**")
+        
+        cols = st.columns(2)
+        for i, clip in enumerate(recent_clips[:10]):
+            with cols[i % 2]:
+                st.write(f"**{clip.get('filename', 'Unknown')}**")
+                clip_path = clip.get("path", "")
+                if clip_path and Path(clip_path).exists():
+                    try:
+                        st.video(clip_path)
+                    except Exception:
+                        st.warning("Could not load video")
+                else:
+                    st.info(f"File: {clip_path}")
+                st.caption(f"Received: {clip.get('received_at', '')[:19]}")
+    else:
+        # Fallback: check inbox directly
+        clips = sorted(inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if clips:
+            st.write(f"**{len(clips)} clips in inbox**")
+            cols = st.columns(2)
+            for i, clip in enumerate(clips[:10]):
+                with cols[i % 2]:
+                    st.write(f"**{clip.name}**")
+                    try:
+                        st.video(str(clip))
+                    except Exception:
+                        st.warning("Could not load video")
+        else:
+            st.info("No clips received yet. Waiting for Windows to process...")
 
 with tab_demos:
-    st.header("Indexed Demos")
+    st.header("Recent Demos")
     
-    demos_info = status.get("demos_info", [])
+    recent_demos = status.get("recent_demos", [])
     
-    if demos_info:
-        show_demos_table(demos_info)
+    if recent_demos:
+        df = pd.DataFrame(recent_demos)
+        display_cols = [c for c in ["map", "downloaded_at", "size_mb"] if c in df.columns]
+        if display_cols:
+            st.dataframe(df[display_cols], width='stretch', hide_index=True)
     else:
         demo_dir = Path(DEFAULT_CONFIG["DEMO_DIR"]).expanduser().resolve()
         demos = list(demo_dir.glob("*.dem"))
         if demos:
-            st.write(f"Found {len(demos)} demo files (not yet indexed)")
+            st.write(f"Found {len(demos)} demo files")
+            demo_list = [{"name": d.name, "size_mb": round(d.stat().st_size / 1024 / 1024, 1)} for d in sorted(demos, key=lambda p: p.stat().st_mtime, reverse=True)[:20]]
+            st.dataframe(pd.DataFrame(demo_list), width='stretch', hide_index=True)
         else:
-            st.info("No demos found. Enable download or add demos to folder.")
+            st.info("No demos found. Daemon will download them automatically.")
 
 with tab_log:
-    st.header("Pipeline Log")
+    st.header("Daemon Status")
     
-    log_path = Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve() / "pipeline.log"
+    st.json(status)
     
-    if log_path.exists():
-        try:
-            log_content = log_path.read_text()
-            # Show last 100 lines
-            lines = log_content.strip().split("\n")
-            recent = "\n".join(lines[-100:])
-            st.code(recent, language="text")
-        except Exception as e:
-            st.warning(f"Could not read log: {e}")
-    else:
-        st.info("No log file yet")
+    # Also show last error if any
+    if status.get("last_error"):
+        st.error(f"Last error: {status.get('last_error')}")
 
-# Auto-refresh while pipeline is running
-if phase not in ["complete", "error", "not_started", "idle"]:
+# Auto-refresh
+if is_running or phase not in ["stopped", "error"]:
     refresh_seconds = DEFAULT_CONFIG["AUTO_REFRESH_SECONDS"]
     st.caption(f"🔄 Auto-refreshing every {refresh_seconds} seconds...")
     time.sleep(refresh_seconds)
     st.rerun()
-
-# Show completion message
-if phase == "complete":
-    st.success("✅ Pipeline complete! All clips have been received.")
-    st.balloons()

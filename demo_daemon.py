@@ -1,49 +1,60 @@
 #!/usr/bin/env python3
 """
-demo_daemon.py - Persistent Steam demo download service
+demo_daemon.py - Persistent Steam demo download + analysis service
 
-Stays logged into Steam and automatically downloads new matches as they appear.
-2FA is only required ONCE when starting the daemon.
+Stays logged into Steam, downloads new matches automatically, and immediately
+triggers clip generation when new demos arrive.
 
 Usage:
-    # Start the daemon (will prompt for 2FA interactively)
-    python demo_daemon.py --demo-dir ./demos
+    # Start the daemon (will prompt for 2FA interactively if no shared_secret)
+    python demo_daemon.py --demo-dir ./demos --player Remag
 
-    # Run in background with nohup
-    nohup python demo_daemon.py --demo-dir ./demos > demo_daemon.log 2>&1 &
+    # Run in background
+    nohup python demo_daemon.py --demo-dir ./demos --player Remag > daemon.log 2>&1 &
 
-    # Check status
-    curl http://localhost:8790/status
+2FA Options (in order of preference):
+    1. STEAM_SHARED_SECRET env var - Auto-generates 2FA codes (best for production)
+    2. Interactive prompt - Enter code manually at startup
 
-    # Trigger manual check
-    curl -X POST http://localhost:8790/check
+To get your shared_secret:
+    - Use Steam Desktop Authenticator (Windows): Look in maFiles/*.maFile
+    - Use steamguard-cli (Linux): ~/.config/steamguard-cli/maFiles/*.maFile
+    - Extract from Android: adb shell run-as com.valvesoftware.android.steam.community
 
 Features:
-    - Stays logged into Steam indefinitely
-    - Polls for new matches every N minutes (default: 5)
-    - Downloads new demos automatically
+    - Stays logged into Steam (2FA only at startup, or auto with shared_secret)
+    - Polls for new matches every N minutes
+    - Immediately analyzes new demos for player mistakes
+    - Sends clip requests to Windows
+    - Updates status file for web UI
     - HTTP API for status and manual triggers
-    - Saves state to resume after restart
 """
 
 from gevent import monkey
 monkey.patch_all()
 
 import argparse
+import base64
 import bz2
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import shutil
 import signal
+import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, List, Dict, Any
 
+import pandas as pd
+import requests as http_requests
 from dotenv import load_dotenv
 from google.protobuf.json_format import MessageToDict
 
@@ -54,29 +65,430 @@ from csgo.client import CSGOClient
 from csgo import sharecode
 from csgo.enums import EGCBaseClientMsg, ECsgoGCMsg
 
-# Optional: HTTP API
 try:
-    from flask import Flask, jsonify
+    from demoparser2 import DemoParser
+    HAS_PARSER = True
+except ImportError:
+    HAS_PARSER = False
+    print("WARNING: demoparser2 not installed - analysis disabled")
+
+try:
+    from flask import Flask, jsonify, request
     HAS_FLASK = True
 except ImportError:
     HAS_FLASK = False
 
 
 # =========================
-# Configuration
+# Steam TOTP Generator
+# =========================
+
+STEAM_ALPHABET = "23456789BCDFGHJKMNPQRTVWXY"
+
+def generate_steam_totp(shared_secret: str) -> str:
+    """
+    Generate a Steam-style 2FA code from the shared_secret.
+    
+    This allows fully automated logins without manual 2FA entry.
+    """
+    # Decode the base64 shared_secret
+    key = base64.b64decode(shared_secret)
+    
+    # Get current time interval (30 second periods)
+    timestamp = int(time.time()) // 30
+    
+    # Create HMAC-SHA1
+    msg = struct.pack(">Q", timestamp)
+    auth = hmac.new(key, msg, hashlib.sha1)
+    digest = auth.digest()
+    
+    # Dynamic truncation
+    start = digest[19] & 0x0F
+    code_int = struct.unpack(">I", digest[start:start + 4])[0] & 0x7FFFFFFF
+    
+    # Convert to Steam's alphabet
+    code_chars = []
+    for _ in range(5):
+        code_chars.append(STEAM_ALPHABET[code_int % len(STEAM_ALPHABET)])
+        code_int //= len(STEAM_ALPHABET)
+    
+    return "".join(code_chars)
+
+
+# =========================
+# Status tracking
+# =========================
+
+@dataclass
+class DaemonStatus:
+    """Status saved to disk for web UI"""
+    running: bool = False
+    phase: str = "idle"  # idle, downloading, analyzing, requesting, complete
+    message: str = ""
+    
+    # Connection
+    steam_connected: bool = False
+    gc_ready: bool = False
+    
+    # Demos
+    last_check: str = ""
+    total_downloaded: int = 0
+    demos_available: int = 0
+    
+    # Current job
+    current_demo: str = ""
+    demos_analyzed: int = 0
+    clips_requested: int = 0
+    clips_received: int = 0
+    
+    # Batch state
+    pending_demos: int = 0  # Demos waiting to be sent in batch
+    pending_clips: int = 0  # Clips waiting to be sent in batch
+    batch_sent: bool = False
+    
+    # Recent activity
+    recent_demos: List[Dict[str, Any]] = field(default_factory=list)
+    recent_clips: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Errors
+    last_error: str = ""
+    
+    def to_dict(self) -> dict:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, d: dict) -> "DaemonStatus":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class StatusManager:
+    def __init__(self, path: Path):
+        self.path = path
+        self.status = DaemonStatus()
+        self._lock = threading.Lock()
+    
+    def load(self):
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                self.status = DaemonStatus.from_dict(data)
+            except Exception:
+                self.status = DaemonStatus()
+    
+    def save(self):
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.status.to_dict(), indent=2, default=str))
+    
+    def update(self, **kwargs):
+        with self._lock:
+            for k, v in kwargs.items():
+                if hasattr(self.status, k):
+                    setattr(self.status, k, v)
+        self.save()
+    
+    def add_recent_demo(self, demo_info: dict):
+        with self._lock:
+            self.status.recent_demos.insert(0, demo_info)
+            self.status.recent_demos = self.status.recent_demos[:20]  # Keep last 20
+        self.save()
+    
+    def add_recent_clip(self, clip_info: dict):
+        with self._lock:
+            self.status.recent_clips.insert(0, clip_info)
+            self.status.recent_clips = self.status.recent_clips[:50]  # Keep last 50
+        self.save()
+
+
+# =========================
+# Logging
+# =========================
+
+def setup_logging(debug: bool = False) -> logging.Logger:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("daemon")
+    if not debug:
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("steam").setLevel(logging.WARNING)
+    return log
+
+
+# =========================
+# Demo Analysis
+# =========================
+
+def detect_bursts(demo_path: Path, tickrate: float, player_filter: str) -> pd.DataFrame:
+    if not HAS_PARSER:
+        return pd.DataFrame()
+    
+    parser = DemoParser(str(demo_path))
+    max_gap_ticks = 8
+    min_bullets = 6
+    
+    try:
+        wf = parser.parse_events(["weapon_fire"])
+        wf = wf[0][1]
+    except Exception:
+        return pd.DataFrame()
+    
+    if wf.empty:
+        return pd.DataFrame()
+    
+    wf = wf[["tick", "user_name", "user_steamid", "weapon"]].copy()
+    wf = wf.sort_values(["user_name", "tick"])
+    
+    if player_filter:
+        wf = wf[wf["user_name"].str.contains(player_filter, case=False, na=False)]
+    
+    if wf.empty:
+        return pd.DataFrame()
+    
+    bursts = []
+    for (player, steamid), shots in wf.groupby(["user_name", "user_steamid"]):
+        ticks = shots["tick"].values
+        weapons = shots["weapon"].values
+        
+        if len(ticks) == 0:
+            continue
+        
+        start = ticks[0]
+        last = ticks[0]
+        bullets = 1
+        weapon_counts = {weapons[0]: 1}
+        
+        for t, w in zip(ticks[1:], weapons[1:]):
+            if t - last <= max_gap_ticks:
+                bullets += 1
+                weapon_counts[w] = weapon_counts.get(w, 0) + 1
+            else:
+                if bullets >= min_bullets:
+                    weapon = max(weapon_counts, key=weapon_counts.get)
+                    bursts.append({
+                        "player": player,
+                        "steamid": int(steamid),
+                        "weapon": weapon,
+                        "start_tick": int(start),
+                        "end_tick": int(last),
+                        "bullets": bullets,
+                        "duration_s": (last - start) / tickrate
+                    })
+                start = t
+                bullets = 1
+                weapon_counts = {w: 1}
+            last = t
+        
+        if bullets >= min_bullets:
+            weapon = max(weapon_counts, key=weapon_counts.get)
+            bursts.append({
+                "player": player,
+                "steamid": int(steamid),
+                "weapon": weapon,
+                "start_tick": int(start),
+                "end_tick": int(last),
+                "bullets": bullets,
+                "duration_s": (last - start) / tickrate
+            })
+    
+    return pd.DataFrame(bursts)
+
+
+def detect_oversprays(demo_path: Path, bursts_df: pd.DataFrame, tickrate: float) -> pd.DataFrame:
+    if not HAS_PARSER or bursts_df.empty:
+        return pd.DataFrame()
+    
+    min_bullets = 6
+    min_duration_s = 0.4
+    die_within_s = 3.0
+    
+    bursts = bursts_df[
+        (bursts_df["bullets"] >= min_bullets) &
+        (bursts_df["duration_s"] >= min_duration_s)
+    ].copy()
+    
+    if bursts.empty:
+        return pd.DataFrame()
+    
+    parser = DemoParser(str(demo_path))
+    
+    try:
+        deaths = parser.parse_events(["player_death"])
+        deaths = deaths[0][1]
+    except Exception:
+        return pd.DataFrame()
+    
+    deaths_v = deaths[["tick", "user_name"]].copy()
+    deaths_v = deaths_v.rename(columns={"tick": "death_tick", "user_name": "player"})
+    deaths_v["death_tick"] = deaths_v["death_tick"].astype(int)
+    
+    kills = deaths[["tick", "attacker_name"]].copy()
+    kills = kills.rename(columns={"tick": "kill_tick", "attacker_name": "player"})
+    kills = kills.dropna(subset=["player"])
+    kills["kill_tick"] = kills["kill_tick"].astype(int)
+    
+    deaths_by_player = {p: g["death_tick"].sort_values().tolist() for p, g in deaths_v.groupby("player")}
+    kills_by_player = {p: g["kill_tick"].sort_values().tolist() for p, g in kills.groupby("player")}
+    
+    die_within_ticks = int(die_within_s * tickrate)
+    
+    oversprays = []
+    for row in bursts.itertuples(index=False):
+        player = row.player
+        start_tick = int(row.start_tick)
+        end_tick = int(row.end_tick)
+        
+        death_tick = None
+        for dt in deaths_by_player.get(player, []):
+            if dt >= end_tick and dt <= end_tick + die_within_ticks:
+                death_tick = dt
+                break
+        
+        if death_tick is None:
+            continue
+        
+        has_kill = False
+        for kt in kills_by_player.get(player, []):
+            if kt >= start_tick and kt <= death_tick:
+                has_kill = True
+                break
+        
+        if has_kill:
+            continue
+        
+        oversprays.append({
+            "player": player,
+            "weapon": row.weapon,
+            "start_tick": start_tick,
+            "end_tick": end_tick,
+            "bullets": int(row.bullets),
+            "duration_s": float(row.duration_s),
+            "death_tick": int(death_tick),
+            "start_s": start_tick / tickrate,
+            "death_s": death_tick / tickrate,
+        })
+    
+    df = pd.DataFrame(oversprays)
+    if not df.empty:
+        df = df.sort_values(["bullets", "duration_s"], ascending=[False, False])
+    return df
+
+
+def get_demo_info(demo_path: Path, tickrate: float = 64.0) -> dict:
+    """Get basic demo info"""
+    if not HAS_PARSER:
+        return {"demo_id": demo_path.stem, "map": "Unknown"}
+    
+    parser = DemoParser(str(demo_path))
+    map_name = "Unknown"
+    
+    try:
+        hdr = parser.parse_header()
+        if isinstance(hdr, dict):
+            map_name = hdr.get("map_name") or hdr.get("map") or map_name
+    except Exception:
+        pass
+    
+    return {
+        "demo_id": demo_path.stem,
+        "filename": demo_path.name,
+        "map": map_name,
+        "size_mb": round(demo_path.stat().st_size / 1024 / 1024, 1),
+        "downloaded_at": datetime.now().isoformat(),
+    }
+
+
+# =========================
+# Steam/CSGO helpers
+# =========================
+
+def find_demo_url(obj) -> Optional[str]:
+    exts = (".dem", ".dem.bz2", ".bz2")
+    if isinstance(obj, dict):
+        for _, v in obj.items():
+            u = find_demo_url(v)
+            if u:
+                return u
+    elif isinstance(obj, list):
+        for v in obj:
+            u = find_demo_url(v)
+            if u:
+                return u
+    elif isinstance(obj, str):
+        low = obj.lower()
+        if obj.startswith("http") and any(ext in low for ext in exts):
+            return obj
+    return None
+
+
+def decode_share_code(code: str) -> tuple:
+    ids = sharecode.decode(code)
+    return int(ids["matchid"]), int(ids["outcomeid"]), int(ids["token"])
+
+
+def download_file(url: str, out_path: Path, timeout_s: int = 120, log: logging.Logger = None) -> bool:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if log:
+        log.info(f"Downloading: {url}")
+    
+    try:
+        with http_requests.get(url, stream=True, timeout=timeout_s) as r:
+            r.raise_for_status()
+            with out_path.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 512):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except Exception as e:
+        if log:
+            log.error(f"Download failed: {e}")
+        return False
+
+
+def get_next_sharecode_webapi(
+    web_api_key: str,
+    steamid64: str,
+    auth_code: str,
+    known_code: str,
+    log: logging.Logger,
+) -> Optional[str]:
+    url = "https://api.steampowered.com/ICSGOPlayers_730/GetNextMatchSharingCode/v1/"
+    params = {
+        "key": web_api_key,
+        "steamid": steamid64,
+        "steamidkey": auth_code,
+        "knowncode": known_code,
+    }
+    
+    try:
+        r = http_requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        
+        result = data.get("result", {})
+        nextcode = result.get("nextcode", "")
+        
+        if isinstance(nextcode, str) and nextcode.startswith("CSGO-"):
+            return nextcode
+    except Exception as e:
+        log.warning(f"WebAPI error: {e}")
+    
+    return None
+
+
+# =========================
+# Daemon State (persistent across restarts)
 # =========================
 
 @dataclass
 class DaemonState:
-    """Persistent state saved to disk"""
     last_sharecode: str = ""
-    last_check: str = ""
-    total_downloaded: int = 0
-    demos_list: list = None
+    processed_demos: List[str] = field(default_factory=list)
     
-    def __post_init__(self):
-        if self.demos_list is None:
-            self.demos_list = []
+    # Pending batch - demos analyzed but not yet sent to Windows
+    pending_batch: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -109,106 +521,42 @@ class StateManager:
             if hasattr(self.state, k):
                 setattr(self.state, k, v)
         self.save()
-
-
-# =========================
-# Logging
-# =========================
-
-def setup_logging(debug: bool = False) -> logging.Logger:
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    log = logging.getLogger("demo_daemon")
-    if not debug:
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-        logging.getLogger("steam").setLevel(logging.WARNING)
-    return log
-
-
-# =========================
-# Steam/CSGO helpers
-# =========================
-
-def find_demo_url(obj) -> Optional[str]:
-    exts = (".dem", ".dem.bz2", ".bz2")
-    if isinstance(obj, dict):
-        for _, v in obj.items():
-            u = find_demo_url(v)
-            if u:
-                return u
-    elif isinstance(obj, list):
-        for v in obj:
-            u = find_demo_url(v)
-            if u:
-                return u
-    elif isinstance(obj, str):
-        low = obj.lower()
-        if obj.startswith("http") and any(ext in low for ext in exts):
-            return obj
-    return None
-
-
-def decode_share_code(code: str) -> tuple:
-    ids = sharecode.decode(code)
-    return int(ids["matchid"]), int(ids["outcomeid"]), int(ids["token"])
-
-
-def download_file(url: str, out_path: Path, timeout_s: int = 120, log: logging.Logger = None) -> bool:
-    import requests
     
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if log:
-        log.info(f"Downloading: {url}")
+    def mark_processed(self, demo_id: str):
+        if demo_id not in self.state.processed_demos:
+            self.state.processed_demos.append(demo_id)
+            self.state.processed_demos = self.state.processed_demos[-200:]  # Keep last 200
+            self.save()
     
-    try:
-        with requests.get(url, stream=True, timeout=timeout_s) as r:
-            r.raise_for_status()
-            with out_path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 512):
-                    if chunk:
-                        f.write(chunk)
-        return True
-    except Exception as e:
-        if log:
-            log.error(f"Download failed: {e}")
-        return False
-
-
-def get_next_sharecode_webapi(
-    web_api_key: str,
-    steamid64: str,
-    auth_code: str,
-    known_code: str,
-    log: logging.Logger,
-) -> Optional[str]:
-    """Get next sharecode using Valve WebAPI"""
-    import requests
+    def is_processed(self, demo_id: str) -> bool:
+        return demo_id in self.state.processed_demos
     
-    url = "https://api.steampowered.com/ICSGOPlayers_730/GetNextMatchSharingCode/v1/"
-    params = {
-        "key": web_api_key,
-        "steamid": steamid64,
-        "steamidkey": auth_code,
-        "knowncode": known_code,
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+    def add_to_batch(self, demo_id: str, demo_path: str, clips: List[dict]):
+        """Add a demo's clips to the pending batch"""
+        # Check if already in batch
+        for item in self.state.pending_batch:
+            if item["demo_id"] == demo_id:
+                return
         
-        result = data.get("result", {})
-        nextcode = result.get("nextcode", "")
-        
-        if isinstance(nextcode, str) and nextcode.startswith("CSGO-"):
-            return nextcode
-    except Exception as e:
-        log.warning(f"WebAPI error: {e}")
+        self.state.pending_batch.append({
+            "demo_id": demo_id,
+            "demo_path": demo_path,
+            "clips": clips,
+        })
+        self.save()
     
-    return None
+    def get_pending_batch(self) -> List[Dict[str, Any]]:
+        """Get pending batch for sending to Windows"""
+        return self.state.pending_batch
+    
+    def clear_batch(self):
+        """Clear pending batch after successful send"""
+        self.state.pending_batch = []
+        self.save()
+    
+    def get_batch_demo_ids(self) -> List[str]:
+        """Get list of demo IDs in pending batch"""
+        return [item["demo_id"] for item in self.state.pending_batch]
 
 
 # =========================
@@ -219,30 +567,57 @@ class DemoDaemon:
     def __init__(
         self,
         demo_dir: Path,
-        state_path: Path,
+        output_dir: Path,
+        inbox_dir: Path,
+        player_name: str,
         gc_version: int,
-        poll_interval_s: int = 300,  # 5 minutes
+        poll_interval_s: int = 300,
+        windows_url: str = "http://10.0.0.108:8788",
+        ubuntu_url: str = "http://10.0.0.196:8787",
+        clip_token: str = "token",
+        tickrate: float = 64.0,
+        top_clips: int = 10,
+        clip_pre_s: float = 3.0,
+        clip_post_s: float = 2.0,
         log: logging.Logger = None,
     ):
         self.demo_dir = demo_dir
+        self.output_dir = output_dir
+        self.inbox_dir = inbox_dir
+        self.player_name = player_name
         self.gc_version = gc_version
         self.poll_interval_s = poll_interval_s
-        self.log = log or logging.getLogger("demo_daemon")
+        self.windows_url = windows_url.rstrip("/")
+        self.ubuntu_url = ubuntu_url.rstrip("/")
+        self.clip_token = clip_token
+        self.tickrate = tickrate
+        self.top_clips = top_clips
+        self.clip_pre_s = clip_pre_s
+        self.clip_post_s = clip_post_s
+        self.log = log or logging.getLogger("daemon")
         
-        self.state = StateManager(state_path)
+        # Paths
+        self.state_path = demo_dir / ".daemon_state.json"
+        self.status_path = output_dir / "daemon_status.json"
         
+        # Managers
+        self.state = StateManager(self.state_path)
+        self.status = StatusManager(self.status_path)
+        
+        # Steam
         self.client = SteamClient()
         self.cs = CSGOClient(self.client)
         
+        # State
         self.gc_ready = False
         self.running = False
-        self.last_error = None
         
         # Config from env
         self.steam_web_api_key = os.environ.get("STEAM_WEB_API_KEY", "").strip()
         self.target_steamid64 = os.environ.get("TARGET_STEAMID64", "").strip()
         self.target_auth_code = os.environ.get("TARGET_AUTH_CODE", "").strip()
         self.start_code = os.environ.get("TARGET_KNOWN_CODE", "").strip()
+        self.shared_secret = os.environ.get("STEAM_SHARED_SECRET", "").strip()
         
         self._setup_handlers()
     
@@ -251,86 +626,165 @@ class DemoDaemon:
         def on_disconnect():
             self.log.warning("Steam disconnected")
             self.gc_ready = False
+            self.status.update(steam_connected=False, gc_ready=False)
+            
+            # Auto-reconnect handled in main loop, not here
+            # (to avoid issues with greenlet state)
         
         @self.client.on("reconnect")
         def on_reconnect(delay):
-            self.log.info(f"Reconnecting in {delay}s...")
+            self.log.info(f"Steam reconnecting in {delay}s...")
         
         @self.cs.on(EGCBaseClientMsg.EMsgGCClientWelcome)
         def on_gc_welcome(msg):
             self.gc_ready = True
             self.log.info("GC ready")
+            self.status.update(gc_ready=True)
         
         @self.cs.on(ECsgoGCMsg.EMsgGCCStrike15_v2_ClientLogonFatalError)
         def on_gc_fatal(msg):
-            self.log.error("GC fatal error - may need to restart")
+            self.log.error("GC fatal error")
             self.gc_ready = False
+            self.status.update(gc_ready=False, last_error="GC fatal error")
+    
+    def _ensure_connected(self) -> bool:
+        """Ensure we're connected to Steam and GC. Reconnect if needed."""
+        # Check if already connected
+        if self.client.connected and self.client.logged_on:
+            if not self.gc_ready:
+                return self.connect_gc()
+            return True
+        
+        # Need to reconnect
+        self.log.info("Connection lost, reconnecting...")
+        
+        for attempt in range(3):
+            try:
+                # Disconnect cleanly first if in bad state
+                if self.client.connected:
+                    try:
+                        self.client.disconnect()
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                
+                if self.login():
+                    if self.connect_gc():
+                        self.log.info("Reconnect successful")
+                        return True
+            except Exception as e:
+                self.log.warning(f"Reconnect attempt {attempt + 1} failed: {e}")
+            
+            time.sleep(30)
+        
+        self.log.error("Failed to reconnect after 3 attempts")
+        return False
     
     def login(self) -> bool:
-        """Interactive login with 2FA prompt"""
-        self.log.info("Logging into Steam (interactive)...")
+        self.log.info("Logging into Steam...")
+        self.status.update(phase="connecting", message="Logging into Steam...")
         
         user = os.environ.get("BOT_STEAM_USER", "").strip()
         pw = os.environ.get("BOT_STEAM_PASS", "").strip()
         
-        if user and pw:
-            # Try with saved credentials first
+        if not user or not pw:
+            self.log.error("BOT_STEAM_USER and BOT_STEAM_PASS required")
+            return False
+        
+        # Check if already logged on
+        if self.client.logged_on:
+            self.log.info("Already logged on")
+            self.status.update(steam_connected=True)
+            return True
+        
+        # Try relogin first (uses saved session)
+        try:
             result = self.client.relogin()
             if result == EResult.OK:
                 self.log.info("Relogin successful (using saved session)")
+                self.status.update(steam_connected=True)
                 return True
+        except Exception as e:
+            self.log.debug(f"Relogin failed: {e}")
+        
+        # Fresh login required
+        if self.shared_secret:
+            # Automatic 2FA using shared_secret
+            self.log.info("Logging in with automatic 2FA (shared_secret)...")
             
-            # Interactive login
-            self.log.info("Enter Steam Guard code when prompted...")
-            result = self.client.cli_login(user, pw)
+            try:
+                result = self.client.login(user, pw)
+            except RuntimeError as e:
+                if "Already logged on" in str(e):
+                    self.log.info("Already logged on")
+                    self.status.update(steam_connected=True)
+                    return True
+                raise
+            
+            if result == EResult.AccountLoginDeniedNeedTwoFactor:
+                # Generate and submit 2FA code
+                code = generate_steam_totp(self.shared_secret)
+                self.log.info(f"Generated 2FA code: {code}")
+                result = self.client.login(user, pw, two_factor_code=code)
+            
+            if result == EResult.TwoFactorCodeMismatch:
+                # Wait and retry (clock sync issue)
+                self.log.warning("2FA code mismatch, retrying in 5s...")
+                time.sleep(5)
+                code = generate_steam_totp(self.shared_secret)
+                result = self.client.login(user, pw, two_factor_code=code)
         else:
-            # Full interactive
-            result = self.client.cli_login()
+            # Interactive login (will prompt for 2FA)
+            self.log.info("Interactive login (enter 2FA when prompted)...")
+            self.log.info("TIP: Set STEAM_SHARED_SECRET for automatic 2FA")
+            result = self.client.cli_login(user, pw)
         
         if result != EResult.OK:
             self.log.error(f"Login failed: {result}")
+            self.status.update(last_error=f"Login failed: {result}")
             return False
         
         self.log.info("Steam login successful")
+        self.status.update(steam_connected=True)
         return True
     
     def connect_gc(self) -> bool:
-        """Connect to CS2 Game Coordinator"""
         self.log.info("Connecting to CS2 GC...")
+        self.status.update(phase="connecting", message="Connecting to CS2...")
         
         self.client.games_played([730])
         
-        # Send hello until welcome
         start = time.time()
         timeout = 60
         
         while time.time() - start < timeout:
             if self.gc_ready:
-                self.log.info("GC connection established")
+                self.log.info("GC connected")
                 return True
             
             self.cs.send(EGCBaseClientMsg.EMsgGCClientHello, {"version": self.gc_version})
             self.client.sleep(3)
         
         self.log.error("GC connection timeout")
+        self.status.update(last_error="GC connection timeout")
         return False
     
-    def download_demo(self, matchid: int, outcomeid: int, token: int) -> bool:
-        """Download a single demo via GC"""
+    def download_demo(self, matchid: int, outcomeid: int, token: int) -> Optional[Path]:
+        """Download a single demo. Returns path if successful."""
         dem_path = self.demo_dir / f"{matchid}.dem"
         bz2_path = self.demo_dir / f"{matchid}.dem.bz2"
         
         if dem_path.exists():
             self.log.info(f"Already have {dem_path.name}")
-            return False
+            return dem_path
         
         self.log.info(f"Requesting match info for {matchid}...")
         self.cs.request_full_match_info(matchid, outcomeid, token)
         
         ev = self.cs.wait_event("full_match_info", timeout=60)
         if not ev:
-            self.log.error(f"Timeout getting match info for {matchid}")
-            return False
+            self.log.error(f"Timeout getting match info")
+            return None
         
         msg = ev[0]
         d = MessageToDict(msg, preserving_proto_field_name=True)
@@ -339,62 +793,238 @@ class DemoDaemon:
         info_path = self.demo_dir / f"{matchid}_info.json"
         info_path.write_text(json.dumps(d, indent=2))
         
-        # Find demo URL
         url = find_demo_url(d)
         if not url:
-            self.log.error(f"No demo URL found for {matchid}")
-            return False
+            self.log.error(f"No demo URL found")
+            return None
         
-        # Download
         if not download_file(url, bz2_path, log=self.log):
-            return False
+            return None
         
-        # Decompress if bz2
+        # Decompress
         try:
             dem_path.write_bytes(bz2.decompress(bz2_path.read_bytes()))
             bz2_path.unlink()
-            self.log.info(f"Downloaded and decompressed: {dem_path.name}")
+            self.log.info(f"Downloaded: {dem_path.name}")
         except Exception:
             self.log.info(f"Downloaded (not bz2): {bz2_path.name}")
+            return bz2_path
         
-        return True
+        return dem_path
+    
+    def analyze_demo(self, demo_path: Path) -> List[dict]:
+        """Analyze demo and return clip specifications"""
+        self.log.info(f"Analyzing {demo_path.name} for player '{self.player_name}'...")
+        self.status.update(
+            phase="analyzing",
+            current_demo=demo_path.name,
+            message=f"Analyzing {demo_path.name}..."
+        )
+        
+        bursts = detect_bursts(demo_path, self.tickrate, self.player_name)
+        if bursts.empty:
+            self.log.info("No bursts found")
+            return []
+        
+        oversprays = detect_oversprays(demo_path, bursts, self.tickrate)
+        if oversprays.empty:
+            self.log.info("No oversprays found")
+            return []
+        
+        # Save analysis
+        demo_out = self.output_dir / demo_path.stem
+        demo_out.mkdir(parents=True, exist_ok=True)
+        oversprays.to_parquet(demo_out / "overspray_candidates.parquet")
+        
+        # Build clips
+        top = oversprays.head(self.top_clips)
+        clips = []
+        for _, row in top.iterrows():
+            start_s = max(0.0, row["start_s"] - self.clip_pre_s)
+            end_s = row["death_s"] + self.clip_post_s
+            clips.append({
+                "start_s": round(start_s, 3),
+                "duration_s": round(end_s - start_s, 3),
+            })
+        
+        self.log.info(f"Found {len(clips)} clip candidates")
+        return clips
+    
+    def process_new_demo(self, demo_path: Path) -> bool:
+        """Analyze demo and add clips to pending batch (don't send yet)"""
+        demo_id = demo_path.stem
+        
+        if self.state.is_processed(demo_id):
+            self.log.debug(f"Already processed: {demo_id}")
+            return False
+        
+        # Get demo info
+        demo_info = get_demo_info(demo_path, self.tickrate)
+        self.status.add_recent_demo(demo_info)
+        
+        # Analyze
+        clips = self.analyze_demo(demo_path)
+        
+        if clips:
+            # Add to pending batch (don't send yet)
+            self.state.add_to_batch(demo_id, str(demo_path), clips)
+            self.log.info(f"Added {len(clips)} clips from {demo_id} to pending batch")
+            
+            # Update status
+            pending = self.state.get_pending_batch()
+            total_clips = sum(len(d["clips"]) for d in pending)
+            self.status.update(
+                pending_demos=len(pending),
+                pending_clips=total_clips,
+            )
+        
+        # Mark as processed
+        self.state.mark_processed(demo_id)
+        self.status.update(demos_analyzed=self.status.status.demos_analyzed + 1)
+        
+        return len(clips) > 0
+    
+    def send_pending_batch(self) -> bool:
+        """Send all pending clips to Windows in a single batch request"""
+        pending = self.state.get_pending_batch()
+        
+        if not pending:
+            self.log.info("No pending clips to send")
+            return True
+        
+        total_clips = sum(len(d["clips"]) for d in pending)
+        self.log.info(f"Sending batch: {len(pending)} demos, {total_clips} clips")
+        
+        self.status.update(
+            phase="requesting",
+            clips_requested=total_clips,
+            message=f"Sending {total_clips} clips from {len(pending)} demos to Windows..."
+        )
+        
+        # Build payload
+        demos_payload = []
+        for item in pending:
+            demos_payload.append({
+                "demo_id": item["demo_id"],
+                "clips": item["clips"],
+            })
+        
+        payload = {
+            "username": self.player_name,
+            "ubuntu_upload_url": f"{self.ubuntu_url}/upload",
+            "demos": demos_payload,
+            "delete_after": True,  # Tell Windows to delete demos after processing
+        }
+        
+        try:
+            r = http_requests.post(
+                f"{self.windows_url}/batch_clips",
+                json=payload,
+                headers={"X-Token": self.clip_token},
+                timeout=7200,  # 2 hours for large batches
+            )
+            r.raise_for_status()
+            result = r.json()
+            self.log.info(f"Batch request result: {result.get('clips_successful', 0)} successful")
+            
+            # Clear pending batch
+            self.state.clear_batch()
+            self.status.update(
+                pending_demos=0,
+                pending_clips=0,
+                batch_sent=True,
+                phase="receiving",
+                message=f"Waiting for {total_clips} clips from Windows..."
+            )
+            
+            return True
+        except Exception as e:
+            self.log.error(f"Batch request failed: {e}")
+            self.status.update(last_error=f"Batch request failed: {e}")
+            return False
+    
+    def delete_demo(self, demo_path: Path) -> bool:
+        """Delete a demo file and its associated files"""
+        demo_id = demo_path.stem
+        
+        try:
+            # Delete main demo file
+            if demo_path.exists():
+                demo_path.unlink()
+                self.log.info(f"Deleted demo: {demo_path.name}")
+            
+            # Delete associated files
+            for suffix in ["_info.json", ".dem.bz2"]:
+                assoc = demo_path.parent / f"{demo_id}{suffix}"
+                if assoc.exists():
+                    assoc.unlink()
+            
+            # Delete analysis output
+            analysis_dir = self.output_dir / demo_id
+            if analysis_dir.exists():
+                shutil.rmtree(analysis_dir)
+            
+            return True
+        except Exception as e:
+            self.log.warning(f"Failed to delete demo {demo_id}: {e}")
+            return False
+    
+    def cleanup_processed_demos(self):
+        """Delete all demos that have been successfully processed"""
+        pending_ids = set(self.state.get_batch_demo_ids())
+        
+        for demo_path in list(self.demo_dir.glob("*.dem")):
+            demo_id = demo_path.stem
+            
+            # Don't delete if in pending batch
+            if demo_id in pending_ids:
+                continue
+            
+            # Delete if processed
+            if self.state.is_processed(demo_id):
+                self.delete_demo(demo_path)
+        
+        self.status.update(demos_available=len(list(self.demo_dir.glob("*.dem"))))
     
     def check_for_new_matches(self) -> int:
-        """Check for and download new matches. Returns count of new demos."""
-        if not self.gc_ready:
-            if not self.connect_gc():
-                return 0
+        """Check for and download ALL new matches, then send batch when done"""
+        if not self._ensure_connected():
+            self.log.error("Cannot check for matches - not connected")
+            return 0
         
-        # Determine starting sharecode
+        self.status.update(phase="checking", message="Checking for new matches...")
+        
         known_code = self.state.state.last_sharecode or self.start_code
         if not known_code:
-            self.log.warning("No starting sharecode configured")
+            self.log.warning("No starting sharecode")
             return 0
         
         if not all([self.steam_web_api_key, self.target_steamid64, self.target_auth_code]):
-            self.log.warning("WebAPI credentials not configured - can only download starting match")
             # Just try the start code
             try:
                 matchid, outcomeid, token = decode_share_code(known_code)
-                if self.download_demo(matchid, outcomeid, token):
-                    self.state.update(
-                        last_sharecode=known_code,
-                        last_check=datetime.now().isoformat(),
-                        total_downloaded=self.state.state.total_downloaded + 1,
-                    )
+                demo_path = self.download_demo(matchid, outcomeid, token)
+                if demo_path and demo_path.exists():
+                    self.status.update(total_downloaded=self.status.status.total_downloaded + 1)
+                    self.process_new_demo(demo_path)
+                    
+                    # Send batch if we have pending clips
+                    if self.state.get_pending_batch():
+                        self.send_pending_batch()
+                    
                     return 1
             except Exception as e:
-                self.log.error(f"Failed to download: {e}")
+                self.log.error(f"Failed: {e}")
             return 0
         
-        # Walk forward through sharecodes
+        # Walk forward through ALL available matches
         downloaded = 0
         current = known_code
-        max_new = 20  # Don't download more than 20 at once
+        max_iterations = 100  # Safety limit
         
-        self.log.info(f"Checking for new matches starting from {current[:20]}...")
+        self.log.info(f"Checking for new matches (will download ALL before sending clips)...")
         
-        for _ in range(max_new):
+        for iteration in range(max_iterations):
             next_code = get_next_sharecode_webapi(
                 self.steam_web_api_key,
                 self.target_steamid64,
@@ -404,84 +1034,176 @@ class DemoDaemon:
             )
             
             if not next_code:
-                self.log.info("No more new matches")
+                # No more matches - we've caught up!
+                self.log.info(f"No more new matches. Downloaded {downloaded} demos total.")
                 break
             
-            self.log.info(f"New match found: {next_code}")
+            self.log.info(f"New match found: {next_code[:20]}...")
+            self.status.update(
+                phase="downloading",
+                message=f"Downloading match {downloaded + 1}..."
+            )
             
             try:
                 matchid, outcomeid, token = decode_share_code(next_code)
-                if self.download_demo(matchid, outcomeid, token):
+                demo_path = self.download_demo(matchid, outcomeid, token)
+                
+                if demo_path and demo_path.exists():
                     downloaded += 1
+                    self.status.update(total_downloaded=self.status.status.total_downloaded + 1)
+                    self.state.update(last_sharecode=next_code)
                     
-                    # Update state
-                    demos_list = self.state.state.demos_list or []
-                    demos_list.append({
-                        "sharecode": next_code,
-                        "matchid": matchid,
-                        "downloaded_at": datetime.now().isoformat(),
-                    })
-                    
-                    self.state.update(
-                        last_sharecode=next_code,
-                        total_downloaded=self.state.state.total_downloaded + 1,
-                        demos_list=demos_list[-100:],  # Keep last 100
-                    )
+                    # Analyze and add to batch (don't send yet)
+                    self.process_new_demo(demo_path)
             except Exception as e:
                 self.log.error(f"Failed to download {next_code}: {e}")
             
             current = next_code
             time.sleep(2)  # Be nice to Valve
         
-        self.state.update(last_check=datetime.now().isoformat())
+        # Update status
+        self.status.update(
+            last_check=datetime.now().isoformat(),
+        )
         
-        if downloaded > 0:
-            self.log.info(f"Downloaded {downloaded} new demos")
+        # Now send batch if we have pending clips
+        pending = self.state.get_pending_batch()
+        if pending:
+            total_clips = sum(len(d["clips"]) for d in pending)
+            self.log.info(f"All demos downloaded. Sending batch: {len(pending)} demos, {total_clips} clips")
+            self.send_pending_batch()
+        else:
+            self.status.update(
+                phase="idle",
+                message=f"Downloaded {downloaded} demos, no clips to send" if downloaded else "No new demos"
+            )
         
         return downloaded
     
+    def check_inbox_for_clips(self):
+        """Check inbox for new clips and update status. Cleanup when complete."""
+        clips = list(self.inbox_dir.glob("*.mp4"))
+        prev_count = self.status.status.clips_received
+        
+        # Update recent clips
+        for clip in sorted(clips, key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+            clip_info = {
+                "filename": clip.name,
+                "path": str(clip),
+                "size_mb": round(clip.stat().st_size / 1024 / 1024, 2),
+                "received_at": datetime.fromtimestamp(clip.stat().st_mtime).isoformat(),
+            }
+            
+            # Check if already in recent
+            existing = [c["filename"] for c in self.status.status.recent_clips]
+            if clip.name not in existing:
+                self.status.add_recent_clip(clip_info)
+        
+        self.status.update(clips_received=len(clips))
+        
+        # Check if batch is complete
+        if self.status.status.batch_sent and self.status.status.clips_requested > 0:
+            if len(clips) >= self.status.status.clips_requested:
+                self.log.info(f"All {len(clips)} clips received! Cleaning up demos...")
+                
+                # Cleanup demos from Ubuntu
+                self.cleanup_processed_demos()
+                
+                self.status.update(
+                    phase="complete",
+                    batch_sent=False,
+                    message=f"✅ Complete! Received {len(clips)} clips."
+                )
+    
+    def scan_existing_demos(self):
+        """Process any unprocessed demos already in demo_dir, then send batch"""
+        demos = sorted(self.demo_dir.glob("*.dem"), key=lambda p: p.stat().st_mtime)
+        
+        processed_any = False
+        for demo_path in demos:
+            if not self.state.is_processed(demo_path.stem):
+                self.log.info(f"Found unprocessed demo: {demo_path.name}")
+                self.process_new_demo(demo_path)
+                processed_any = True
+        
+        # Send batch if we processed any demos
+        if processed_any and self.state.get_pending_batch():
+            self.log.info("Finished processing existing demos, sending batch...")
+            self.send_pending_batch()
+    
     def run(self):
-        """Main daemon loop"""
         self.running = True
-        self.log.info("Demo daemon starting...")
+        self.status.update(
+            running=True,
+            phase="starting",
+            message="Starting daemon..."
+        )
         
-        # Initial login
+        # Ensure directories
+        self.demo_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Login
         if not self.login():
-            self.log.error("Failed to login - exiting")
+            self.status.update(running=False, phase="error")
             return
         
-        # Connect to GC
+        # Connect GC
         if not self.connect_gc():
-            self.log.error("Failed to connect to GC - exiting")
+            self.status.update(running=False, phase="error")
             return
         
-        self.log.info(f"Daemon running. Checking every {self.poll_interval_s}s")
-        self.log.info(f"Demos will be saved to: {self.demo_dir}")
+        self.log.info(f"Daemon running. Player: {self.player_name}")
+        self.log.info(f"Demo dir: {self.demo_dir}")
+        self.log.info(f"Polling every {self.poll_interval_s}s")
+        
+        self.status.update(
+            phase="idle",
+            message="Ready",
+            demos_available=len(list(self.demo_dir.glob("*.dem")))
+        )
+        
+        # Process existing unprocessed demos
+        self.scan_existing_demos()
         
         # Initial check
         self.check_for_new_matches()
         
         # Main loop
+        last_inbox_check = 0
+        
         while self.running:
             try:
-                # Sleep in small intervals to allow shutdown
-                for _ in range(self.poll_interval_s):
+                # Check inbox frequently
+                if time.time() - last_inbox_check > 5:
+                    self.check_inbox_for_clips()
+                    last_inbox_check = time.time()
+                
+                # Sleep in intervals
+                for i in range(self.poll_interval_s):
                     if not self.running:
                         break
+                    
+                    # Check inbox every 5 seconds during wait
+                    if i % 5 == 0:
+                        self.check_inbox_for_clips()
+                    
                     self.client.sleep(1)
                 
                 if self.running:
                     self.check_for_new_matches()
                     
             except KeyboardInterrupt:
-                self.log.info("Interrupted")
                 break
             except Exception as e:
-                self.log.exception(f"Error in main loop: {e}")
-                self.last_error = str(e)
-                time.sleep(30)  # Wait before retry
+                self.log.exception(f"Error: {e}")
+                self.status.update(last_error=str(e))
+                time.sleep(30)
         
         self.log.info("Daemon stopping...")
+        self.status.update(running=False, phase="stopped")
+        
         try:
             self.client.disconnect()
         except Exception:
@@ -491,20 +1213,11 @@ class DemoDaemon:
         self.running = False
     
     def get_status(self) -> dict:
-        return {
-            "running": self.running,
-            "gc_ready": self.gc_ready,
-            "last_check": self.state.state.last_check,
-            "last_sharecode": self.state.state.last_sharecode,
-            "total_downloaded": self.state.state.total_downloaded,
-            "last_error": self.last_error,
-            "demo_dir": str(self.demo_dir),
-            "poll_interval_s": self.poll_interval_s,
-        }
+        return self.status.status.to_dict()
 
 
 # =========================
-# HTTP API (optional)
+# HTTP API
 # =========================
 
 def create_api(daemon: DemoDaemon):
@@ -512,6 +1225,7 @@ def create_api(daemon: DemoDaemon):
         return None
     
     app = Flask(__name__)
+    app.logger.setLevel(logging.WARNING)
     
     @app.route("/status")
     def status():
@@ -522,6 +1236,22 @@ def create_api(daemon: DemoDaemon):
         count = daemon.check_for_new_matches()
         return jsonify({"ok": True, "new_demos": count})
     
+    @app.route("/process", methods=["POST"])
+    def process_existing():
+        """Process all unprocessed demos"""
+        daemon.scan_existing_demos()
+        return jsonify({"ok": True})
+    
+    @app.route("/send_batch", methods=["POST"])
+    def send_batch():
+        """Force send pending batch now"""
+        pending = daemon.state.get_pending_batch()
+        if not pending:
+            return jsonify({"ok": False, "error": "No pending batch"})
+        
+        success = daemon.send_pending_batch()
+        return jsonify({"ok": success})
+    
     @app.route("/demos")
     def list_demos():
         demos = sorted(daemon.demo_dir.glob("*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -529,6 +1259,23 @@ def create_api(daemon: DemoDaemon):
             "count": len(demos),
             "demos": [{"name": d.name, "size_mb": round(d.stat().st_size / 1024 / 1024, 1)} for d in demos[:50]]
         })
+    
+    @app.route("/clips")
+    def list_clips():
+        clips = sorted(daemon.inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return jsonify({
+            "count": len(clips),
+            "clips": [{"name": c.name, "size_mb": round(c.stat().st_size / 1024 / 1024, 1)} for c in clips[:50]]
+        })
+    
+    @app.route("/2fa")
+    def get_2fa_code():
+        """Generate current 2FA code (for testing shared_secret)"""
+        if not daemon.shared_secret:
+            return jsonify({"error": "STEAM_SHARED_SECRET not configured"}), 400
+        
+        code = generate_steam_totp(daemon.shared_secret)
+        return jsonify({"code": code, "valid_for": 30 - (int(time.time()) % 30)})
     
     return app
 
@@ -540,40 +1287,47 @@ def create_api(daemon: DemoDaemon):
 def main():
     load_dotenv()
     
-    ap = argparse.ArgumentParser(description="CS2 Demo Download Daemon")
-    ap.add_argument("--demo-dir", type=Path, default=Path("./demos"), help="Where to save demos")
+    ap = argparse.ArgumentParser(description="CS2 Demo Daemon - Download + Analyze + Clip")
+    ap.add_argument("--player", required=True, help="Player name (e.g., Remag)")
+    ap.add_argument("--demo-dir", type=Path, default=Path("./demos"))
+    ap.add_argument("--output-dir", type=Path, default=Path("./output"))
+    ap.add_argument("--inbox-dir", type=Path, default=Path("./inbox"))
+    
     ap.add_argument("--gc-version", type=int, default=int(os.environ.get("GC_VERSION", "2000696")))
-    ap.add_argument("--poll-interval", type=int, default=300, help="Seconds between checks (default: 300)")
-    ap.add_argument("--api-port", type=int, default=8790, help="HTTP API port (default: 8790)")
-    ap.add_argument("--no-api", action="store_true", help="Disable HTTP API")
+    ap.add_argument("--poll-interval", type=int, default=300, help="Seconds between checks")
+    
+    ap.add_argument("--windows-url", default=os.environ.get("WINDOWS_BASE_URL", "http://10.0.0.108:8788"))
+    ap.add_argument("--ubuntu-url", default=os.environ.get("UBUNTU_BASE_URL", "http://10.0.0.196:8787"))
+    
+    ap.add_argument("--api-port", type=int, default=8790)
+    ap.add_argument("--no-api", action="store_true")
     ap.add_argument("--debug", action="store_true")
     
     args = ap.parse_args()
     
     log = setup_logging(args.debug)
     
-    demo_dir = args.demo_dir.expanduser().resolve()
-    demo_dir.mkdir(parents=True, exist_ok=True)
-    
-    state_path = demo_dir / ".daemon_state.json"
-    
     daemon = DemoDaemon(
-        demo_dir=demo_dir,
-        state_path=state_path,
+        demo_dir=args.demo_dir.expanduser().resolve(),
+        output_dir=args.output_dir.expanduser().resolve(),
+        inbox_dir=args.inbox_dir.expanduser().resolve(),
+        player_name=args.player,
         gc_version=args.gc_version,
         poll_interval_s=args.poll_interval,
+        windows_url=args.windows_url,
+        ubuntu_url=args.ubuntu_url,
+        clip_token=os.environ.get("CLIP_TOKEN", "token"),
         log=log,
     )
     
-    # Handle shutdown
     def shutdown(sig, frame):
-        log.info("Shutdown signal received")
+        log.info("Shutdown signal")
         daemon.stop()
     
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     
-    # Start HTTP API in background
+    # Start HTTP API
     if not args.no_api and HAS_FLASK:
         api = create_api(daemon)
         if api:
@@ -582,9 +1336,8 @@ def main():
                 daemon=True,
             )
             api_thread.start()
-            log.info(f"HTTP API running on http://localhost:{args.api_port}")
+            log.info(f"API: http://localhost:{args.api_port}")
     
-    # Run daemon
     daemon.run()
 
 
