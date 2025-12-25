@@ -242,6 +242,8 @@ def main():
             "--output-dir", str(OUTPUT_DIR),
             "--inbox-dir", str(INBOX_DIR),
             "--api-port", str(DAEMON_PORT),
+            "--local-only",
+            "--reprocess"
         ],
         log_file=OUTPUT_DIR / "daemon.log",
     )

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-app.py - CS2 Coach Web UI
+app_integrated.py - CS2 Coach Web UI
 
-Shows daemon status, recent demos, and clips as they arrive.
+Clean UI showing analysis results and coaching tips.
 
 Usage:
     streamlit run app_integrated.py
@@ -28,16 +28,13 @@ load_dotenv()
 # Configuration
 # =========================
 
-# These can be overridden via environment variables
 DEFAULT_CONFIG = {
     "PLAYER_NAME": os.environ.get("PLAYER_NAME", "Remag"),
     "DEMO_DIR": os.environ.get("DEMO_DIR", "./demos"),
     "OUTPUT_DIR": os.environ.get("OUTPUT_DIR", "./output"),
     "INBOX_DIR": os.environ.get("INBOX_DIR", "./inbox"),
-    "WINDOWS_URL": os.environ.get("WINDOWS_BASE_URL", "http://10.0.0.108:8788"),
-    "UBUNTU_URL": os.environ.get("UBUNTU_BASE_URL", "http://10.0.0.196:8787"),
     "DAEMON_URL": os.environ.get("DAEMON_URL", "http://localhost:8790"),
-    "AUTO_REFRESH_SECONDS": int(os.environ.get("AUTO_REFRESH_SECONDS", "5")),
+    "AUTO_REFRESH_SECONDS": int(os.environ.get("AUTO_REFRESH_SECONDS", "10")),
 }
 
 
@@ -61,113 +58,82 @@ def read_daemon_status() -> dict:
         return {"running": False, "phase": "error", "message": f"Failed to read status: {e}"}
 
 
-def get_daemon_status() -> dict:
-    """Get status from demo daemon"""
-    try:
-        r = requests.get(DEFAULT_CONFIG["DAEMON_URL"] + "/status", timeout=2)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return {"running": False, "error": "Daemon not reachable"}
-
-
-# =========================
-# UI Helpers
-# =========================
-
-def format_datetime(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "Unknown"
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return iso_str
-
-
-def phase_to_emoji(phase: str) -> str:
-    return {
-        "not_started": "⏸️",
-        "idle": "⏸️",
-        "starting": "🚀",
-        "downloading": "⬇️",
-        "indexing": "📋",
-        "analyzing": "🔍",
-        "requesting": "📤",
-        "receiving": "📥",
-        "complete": "✅",
-        "error": "❌",
-    }.get(phase, "❓")
-
-
-def show_phase_progress(status: dict):
-    """Show pipeline phase progress"""
-    phase = status.get("phase", "unknown")
-    message = status.get("message", "")
+def get_analysis_summary(output_dir: Path, player_name: str = "") -> dict:
+    """Read analysis results and compute summary statistics for all mistake types"""
+    summary = {
+        # Overspray stats
+        "overspray_count": 0,
+        "avg_bullets": 0,
+        "avg_spray_duration": 0,
+        "avg_time_to_death": 0,
+        # Knife death stats
+        "knife_death_count": 0,
+        # General
+        "demos_analyzed": 0,
+        "clips_exported": 0,
+    }
     
-    phases = ["downloading", "indexing", "analyzing", "requesting", "receiving", "complete"]
+    if not output_dir.exists():
+        return summary
     
-    if phase == "error":
-        st.error(f"❌ Error: {status.get('error', message)}")
-        return
+    all_oversprays = []
+    all_knife_deaths = []
+    demos_with_data = set()
     
-    if phase in ["not_started", "idle"]:
-        st.info("⏸️ Pipeline not running")
-        return
+    # Read all analysis files
+    for demo_dir in output_dir.iterdir():
+        if demo_dir.is_dir():
+            # Overspray candidates
+            overspray_file = demo_dir / "overspray_candidates.parquet"
+            if overspray_file.exists():
+                try:
+                    df = pd.read_parquet(overspray_file)
+                    if not df.empty:
+                        if player_name and "player" in df.columns:
+                            df = df[df["player"].str.contains(player_name, case=False, na=False)]
+                        if not df.empty:
+                            all_oversprays.append(df)
+                            demos_with_data.add(demo_dir.name)
+                except Exception:
+                    pass
+            
+            # Knife deaths
+            knife_file = demo_dir / "knife_deaths.parquet"
+            if knife_file.exists():
+                try:
+                    df = pd.read_parquet(knife_file)
+                    if not df.empty:
+                        if player_name and "player" in df.columns:
+                            df = df[df["player"].str.contains(player_name, case=False, na=False)]
+                        if not df.empty:
+                            all_knife_deaths.append(df)
+                            demos_with_data.add(demo_dir.name)
+                except Exception:
+                    pass
     
-    # Progress bar
-    try:
-        current_idx = phases.index(phase) if phase in phases else 0
-        progress = (current_idx + 1) / len(phases)
-    except ValueError:
-        progress = 0.1
+    summary["demos_analyzed"] = len(demos_with_data)
     
-    st.progress(progress)
-    st.write(f"{phase_to_emoji(phase)} **{phase.title()}**: {message}")
-
-
-def show_demos_table(demos_info: list):
-    """Show indexed demos table"""
-    if not demos_info:
-        return
+    # Overspray stats
+    if all_oversprays:
+        combined = pd.concat(all_oversprays, ignore_index=True)
+        summary["overspray_count"] = len(combined)
+        if len(combined) > 0:
+            summary["avg_bullets"] = combined["bullets"].mean()
+            summary["avg_spray_duration"] = combined["duration_s"].mean()
+            if "time_to_death_after_burst_s" in combined.columns:
+                summary["avg_time_to_death"] = combined["time_to_death_after_burst_s"].mean()
     
-    df = pd.DataFrame(demos_info)
+    # Knife death stats
+    if all_knife_deaths:
+        combined_knife = pd.concat(all_knife_deaths, ignore_index=True)
+        summary["knife_death_count"] = len(combined_knife)
     
-    # Format columns
-    if "played_at" in df.columns:
-        df["played_at"] = df["played_at"].apply(format_datetime)
+    # Count clips in inbox
+    inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
+    if inbox_dir.exists():
+        summary["clips_exported"] = len(list(inbox_dir.glob("*.mp4")))
     
-    if "size_mb" in df.columns:
-        df["size_mb"] = df["size_mb"].apply(lambda x: f"{x:.1f} MB")
-    
-    display_cols = ["map", "played_at", "size_mb"]
-    display_cols = [c for c in display_cols if c in df.columns]
-    
-    st.dataframe(df[display_cols], width='stretch', hide_index=True)
-
-
-def show_clips_grid(clips_info: list, inbox_dir: Path):
-    """Show received clips in a grid"""
-    if not clips_info:
-        # Check inbox directly
-        clips = sorted(inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not clips:
-            st.info("No clips received yet...")
-            return
-        
-        clips_info = [{"filename": c.name, "path": str(c)} for c in clips]
-    
-    st.write(f"**{len(clips_info)} clips received**")
-    
-    # Show clips in columns
-    cols = st.columns(2)
-    for i, clip in enumerate(clips_info):
-        with cols[i % 2]:
-            st.write(f"**{clip['filename']}**")
-            try:
-                st.video(clip["path"])
-            except Exception as e:
-                st.warning(f"Could not load video: {e}")
+    return summary
 
 
 # =========================
@@ -180,106 +146,82 @@ st.set_page_config(
     layout="wide",
 )
 
-# Custom CSS
+# Custom CSS - hide running indicator and clean up
 st.markdown("""
 <style>
     .block-container { padding-top: 2rem !important; }
     h1 { margin-top: 0 !important; }
-    .stProgress > div > div { background-color: #4CAF50; }
+    
+    /* Hide the running/stop indicator in top right */
+    [data-testid="stStatusWidget"] { display: none !important; }
+    header[data-testid="stHeader"] { display: none !important; }
+    
+    /* Clean metric styling */
+    [data-testid="stMetricValue"] { font-size: 2rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
-st.title("🎮 CS2 Coach")
-st.caption(f"Analyzing mistakes for player: **{DEFAULT_CONFIG['PLAYER_NAME']}**")
+# Initialize session state
+if "player_name" not in st.session_state:
+    st.session_state.player_name = DEFAULT_CONFIG["PLAYER_NAME"]
 
-# Sidebar configuration
+# Sidebar - simplified
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("🎮 CS2 Coach")
     
-    st.text_input("Player Name", value=DEFAULT_CONFIG["PLAYER_NAME"], key="cfg_player", disabled=True)
-    st.text_input("Demo Directory", value=DEFAULT_CONFIG["DEMO_DIR"], key="cfg_demo_dir", disabled=True)
-    st.text_input("Windows Server", value=DEFAULT_CONFIG["WINDOWS_URL"], key="cfg_windows", disabled=True)
-    
-    st.divider()
-    
-    # Daemon controls
-    st.header("📡 Daemon Controls")
-    daemon_status = get_daemon_status()
-    
-    if daemon_status.get("running"):
-        st.success("✅ Daemon running")
-        
-        if st.button("🔄 Check for new demos", width='stretch'):
-            try:
-                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/check", timeout=60)
-                r.raise_for_status()
-                result = r.json()
-                if result.get("new_demos", 0) > 0:
-                    st.success(f"Downloaded {result['new_demos']} new demos!")
-                else:
-                    st.info("No new demos available")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Check failed: {e}")
-        
-        if st.button("🔄 Reprocess existing demos", width='stretch'):
-            try:
-                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/process", timeout=300)
-                r.raise_for_status()
-                st.success("Processing started!")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Process failed: {e}")
-    else:
-        st.warning("⚠️ Daemon not running")
-        st.code(f"python demo_daemon.py --player {DEFAULT_CONFIG['PLAYER_NAME']}", language="bash")
+    # Editable player name
+    new_player = st.text_input(
+        "Player Name", 
+        value=st.session_state.player_name,
+        help="Your in-game name to filter analysis"
+    )
+    if new_player != st.session_state.player_name:
+        st.session_state.player_name = new_player
+        st.rerun()
     
     st.divider()
     
     if st.button("🔄 Refresh", width='stretch'):
         st.rerun()
-    
-    st.divider()
-    st.caption("Edit .env file to change settings")
 
 # Read current status
 status = read_daemon_status()
 phase = status.get("phase", "not_started")
 is_running = status.get("running", False)
 
-# Main content
-st.divider()
-
-# Status section
-st.header("📊 Status")
-
-# Show daemon status
-if is_running:
-    col_status, col_phase = st.columns([1, 3])
-    with col_status:
+# Header with status
+col_title, col_status = st.columns([3, 1])
+with col_title:
+    st.title("🎮 CS2 Coach")
+    st.caption(f"Analyzing mistakes for player: **{st.session_state.player_name}**")
+with col_status:
+    if is_running:
         if status.get("gc_ready"):
             st.success("🟢 Connected")
         elif status.get("steam_connected"):
-            st.warning("🟡 Steam OK, GC pending")
+            st.warning("🟡 Connecting...")
         else:
-            st.error("🔴 Connecting...")
-    with col_phase:
-        st.write(f"**{phase.title()}**: {status.get('message', '')}")
-else:
-    st.warning("⚠️ Daemon not running. Start with: `python demo_daemon.py --player Remag`")
+            st.info("🔵 Starting...")
+    else:
+        st.error("🔴 Offline")
+
+st.divider()
+
+# Status message
+if phase == "complete":
+    st.success(f"✅ {status.get('message', 'Complete!')}")
+elif phase in ["downloading", "analyzing", "requesting", "receiving"]:
+    st.info(f"⏳ {status.get('message', phase.title() + '...')}")
+elif phase == "error":
+    st.error(f"❌ {status.get('last_error', 'Unknown error')}")
 
 # Stats row
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Demos Downloaded", status.get("total_downloaded", 0))
 col2.metric("Demos Analyzed", status.get("demos_analyzed", 0))
 
-# Show pending vs requested based on phase
 pending_clips = status.get("pending_clips", 0)
 clips_requested = status.get("clips_requested", 0)
-
 if pending_clips > 0 and not status.get("batch_sent"):
     col3.metric("Clips Pending", pending_clips)
 else:
@@ -287,100 +229,187 @@ else:
 
 col4.metric("Clips Received", status.get("clips_received", 0))
 
-# Show pending batch info
-if status.get("pending_demos", 0) > 0:
-    col_info, col_btn = st.columns([3, 1])
-    with col_info:
-        st.info(f"📦 Batch pending: {status.get('pending_demos', 0)} demos, {pending_clips} clips (will send when all demos downloaded)")
-    with col_btn:
-        if st.button("Send Now", type="primary"):
-            try:
-                r = requests.post(DEFAULT_CONFIG["DAEMON_URL"] + "/send_batch", timeout=60)
-                r.raise_for_status()
-                st.success("Batch sent!")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed: {e}")
-
-if status.get("last_check"):
-    st.caption(f"Last check: {status.get('last_check', '')[:19]}")
+# Get analysis summary
+output_dir = Path(DEFAULT_CONFIG["OUTPUT_DIR"]).expanduser().resolve()
+summary = get_analysis_summary(output_dir, st.session_state.player_name)
 
 st.divider()
 
-# Tabs for different views
-tab_clips, tab_demos, tab_log = st.tabs(["📹 Clips", "🎮 Demos", "📋 Status"])
+# Mistake Analysis Tabs - only show when we have data
+has_oversprays = summary["overspray_count"] > 0
+has_knife_deaths = summary["knife_death_count"] > 0
 
-with tab_clips:
-    st.header("Recent Clips")
+if summary["clips_exported"] > 0 or has_oversprays or has_knife_deaths:
     
-    inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
-    recent_clips = status.get("recent_clips", [])
+    # Create tabs for different mistake types
+    mistake_tabs = st.tabs(["🔫 Oversprays", "🔪 Knife Deaths", "📹 Clips", "🎮 Demos"])
     
-    if recent_clips:
-        st.write(f"**{len(recent_clips)} recent clips**")
+    # === Overspray Tab ===
+    with mistake_tabs[0]:
+        if has_oversprays:
+            st.markdown(f"""
+### Detected {summary['overspray_count']} overspray cases
+
+You kept spraying, got no kill, and died soon after.
+
+**Stats from exported clips:**
+- Avg bullets fired: **{summary['avg_bullets']:.1f}**
+- Avg spray duration: **{summary['avg_spray_duration']:.2f}s**
+- Avg time-to-death after burst: **{summary['avg_time_to_death']:.2f}s**
+            """)
+            
+            with st.expander("💡 How to Fix", expanded=True):
+                st.markdown("""
+**Try instead:**
+- 🎯 **Burst 3–5 bullets, then reset.** Don't commit to full sprays unless you're confident in the kill.
+- 🏃 **Strafe/reposition after first contact** instead of committing to a long spray. Movement beats aim in many situations.
+- ⏸️ **If you whiff, stop shooting briefly** to regain accuracy, then re-peek intentionally. Panic spraying rarely works.
+- 🔄 **Counter-strafe before shooting** to ensure first-bullet accuracy on your re-peek.
+                """)
+        else:
+            st.info("No overspray mistakes detected. Great spray control! 🎯")
+    
+    # === Knife Death Tab ===
+    with mistake_tabs[1]:
+        if has_knife_deaths:
+            st.markdown(f"""
+### Detected {summary['knife_death_count']} knife death cases
+
+You died while holding your knife instead of a weapon.
+            """)
+            
+            with st.expander("💡 How to Fix", expanded=True):
+                st.markdown("""
+**Try instead:**
+- 🔫 **Always hold a gun when enemies might appear.** The speed boost from knife isn't worth dying for.
+- 🗺️ **Know your timings.** Only pull out knife when you're 100% sure no enemy can reach you.
+- 👂 **Listen for audio cues.** Footsteps, reloads, or utility usage means enemies are close - switch to gun.
+- 🚪 **Gun out near corners and chokepoints.** These are high-danger zones where enemies commonly appear.
+- ⏱️ **After plant/defuse situations**, always expect enemies to push - never knife out.
+- 🏃 **If you need speed**, consider a pistol instead - nearly as fast but you can fight back.
+                """)
+        else:
+            st.info("No knife deaths detected. Good weapon discipline! 🔫")
+    
+    # === Clips Tab ===
+    with mistake_tabs[2]:
+        inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
         
-        cols = st.columns(2)
-        for i, clip in enumerate(recent_clips[:10]):
-            with cols[i % 2]:
-                st.write(f"**{clip.get('filename', 'Unknown')}**")
-                clip_path = clip.get("path", "")
-                if clip_path and Path(clip_path).exists():
-                    try:
-                        st.video(clip_path)
-                    except Exception:
-                        st.warning("Could not load video")
-                else:
-                    st.info(f"File: {clip_path}")
-                st.caption(f"Received: {clip.get('received_at', '')[:19]}")
-    else:
-        # Fallback: check inbox directly
-        clips = sorted(inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if inbox_dir.exists():
+            clips = sorted(inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        else:
+            clips = []
+        
         if clips:
-            st.write(f"**{len(clips)} clips in inbox**")
+            st.write(f"**{len(clips)} clips available**")
+            
             cols = st.columns(2)
             for i, clip in enumerate(clips[:10]):
                 with cols[i % 2]:
-                    st.write(f"**{clip.name}**")
+                    display_name = clip.stem
+                    if len(display_name) > 40:
+                        display_name = display_name[:37] + "..."
+                    
+                    st.write(f"**{display_name}**")
                     try:
                         st.video(str(clip))
                     except Exception:
                         st.warning("Could not load video")
+                    
+                    size_mb = clip.stat().st_size / 1024 / 1024
+                    mtime = datetime.fromtimestamp(clip.stat().st_mtime).strftime("%H:%M:%S")
+                    st.caption(f"{size_mb:.1f} MB • {mtime}")
         else:
-            st.info("No clips received yet. Waiting for Windows to process...")
-
-with tab_demos:
-    st.header("Recent Demos")
+            if is_running and phase in ["requesting", "receiving"]:
+                st.info("⏳ Waiting for clips from Windows...")
+            else:
+                st.info("No clips yet. Run the daemon to analyze demos and generate clips.")
     
-    recent_demos = status.get("recent_demos", [])
-    
-    if recent_demos:
-        df = pd.DataFrame(recent_demos)
-        display_cols = [c for c in ["map", "downloaded_at", "size_mb"] if c in df.columns]
-        if display_cols:
-            st.dataframe(df[display_cols], width='stretch', hide_index=True)
-    else:
+    # === Demos Tab ===
+    with mistake_tabs[3]:
         demo_dir = Path(DEFAULT_CONFIG["DEMO_DIR"]).expanduser().resolve()
-        demos = list(demo_dir.glob("*.dem"))
-        if demos:
-            st.write(f"Found {len(demos)} demo files")
-            demo_list = [{"name": d.name, "size_mb": round(d.stat().st_size / 1024 / 1024, 1)} for d in sorted(demos, key=lambda p: p.stat().st_mtime, reverse=True)[:20]]
-            st.dataframe(pd.DataFrame(demo_list), width='stretch', hide_index=True)
+        
+        if demo_dir.exists():
+            demos = sorted(demo_dir.glob("*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
         else:
-            st.info("No demos found. Daemon will download them automatically.")
+            demos = []
+        
+        if demos:
+            st.write(f"**{len(demos)} demo files**")
+            
+            demo_data = []
+            for d in demos[:20]:
+                demo_data.append({
+                    "Name": d.stem[:40] + ("..." if len(d.stem) > 40 else ""),
+                    "Size (MB)": round(d.stat().st_size / 1024 / 1024, 1),
+                    "Modified": datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+            
+            st.dataframe(pd.DataFrame(demo_data), hide_index=True, width='stretch')
+        else:
+            st.info("No demos found. The daemon will download them automatically.")
 
-with tab_log:
-    st.header("Daemon Status")
+else:
+    # No data yet - show simple tabs
+    tab_clips, tab_demos = st.tabs(["📹 Clips", "🎮 Demos"])
     
-    st.json(status)
+    with tab_clips:
+        inbox_dir = Path(DEFAULT_CONFIG["INBOX_DIR"]).expanduser().resolve()
+        
+        if inbox_dir.exists():
+            clips = sorted(inbox_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        else:
+            clips = []
+        
+        if clips:
+            st.write(f"**{len(clips)} clips available**")
+            
+            cols = st.columns(2)
+            for i, clip in enumerate(clips[:10]):
+                with cols[i % 2]:
+                    display_name = clip.stem
+                    if len(display_name) > 40:
+                        display_name = display_name[:37] + "..."
+                    
+                    st.write(f"**{display_name}**")
+                    try:
+                        st.video(str(clip))
+                    except Exception:
+                        st.warning("Could not load video")
+                    
+                    size_mb = clip.stat().st_size / 1024 / 1024
+                    mtime = datetime.fromtimestamp(clip.stat().st_mtime).strftime("%H:%M:%S")
+                    st.caption(f"{size_mb:.1f} MB • {mtime}")
+        else:
+            if is_running and phase in ["requesting", "receiving"]:
+                st.info("⏳ Waiting for clips from Windows...")
+            else:
+                st.info("No clips yet. Run the daemon to analyze demos and generate clips.")
     
-    # Also show last error if any
-    if status.get("last_error"):
-        st.error(f"Last error: {status.get('last_error')}")
+    with tab_demos:
+        demo_dir = Path(DEFAULT_CONFIG["DEMO_DIR"]).expanduser().resolve()
+        
+        if demo_dir.exists():
+            demos = sorted(demo_dir.glob("*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
+        else:
+            demos = []
+        
+        if demos:
+            st.write(f"**{len(demos)} demo files**")
+            
+            demo_data = []
+            for d in demos[:20]:
+                demo_data.append({
+                    "Name": d.stem[:40] + ("..." if len(d.stem) > 40 else ""),
+                    "Size (MB)": round(d.stat().st_size / 1024 / 1024, 1),
+                    "Modified": datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+            
+            st.dataframe(pd.DataFrame(demo_data), hide_index=True, width='stretch')
+        else:
+            st.info("No demos found. The daemon will download them automatically.")
 
-# Auto-refresh
-if is_running or phase not in ["stopped", "error"]:
-    refresh_seconds = DEFAULT_CONFIG["AUTO_REFRESH_SECONDS"]
-    st.caption(f"🔄 Auto-refreshing every {refresh_seconds} seconds...")
-    time.sleep(refresh_seconds)
+# Auto-refresh (silent, no visual indicator)
+if is_running and phase not in ["complete", "error", "idle"]:
+    time.sleep(DEFAULT_CONFIG["AUTO_REFRESH_SECONDS"])
     st.rerun()

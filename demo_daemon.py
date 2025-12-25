@@ -376,6 +376,123 @@ def detect_oversprays(demo_path: Path, bursts_df: pd.DataFrame, tickrate: float)
     return df
 
 
+def detect_knife_deaths(demo_path: Path, tickrate: float, player_filter: str) -> pd.DataFrame:
+    """Detect deaths where player was holding a knife
+    
+    Note: At the exact death tick, active_weapon_name is None (player is dead).
+    We need to check 1-2 ticks BEFORE death to get the weapon they were holding.
+    
+    Excludes:
+    - Bomb deaths (planted_c4) - not a mistake to have knife when bomb explodes
+    - Fire/grenade deaths - environmental
+    - Suicides/world deaths
+    """
+    if not HAS_PARSER:
+        return pd.DataFrame()
+    
+    parser = DemoParser(str(demo_path))
+    
+    try:
+        deaths = parser.parse_events(["player_death"])
+        deaths = deaths[0][1]
+    except Exception:
+        return pd.DataFrame()
+    
+    if deaths.empty:
+        return pd.DataFrame()
+    
+    # Filter by player
+    if player_filter:
+        player_deaths = deaths[deaths["user_name"].str.contains(player_filter, case=False, na=False)]
+    else:
+        player_deaths = deaths
+    
+    if player_deaths.empty:
+        return pd.DataFrame()
+    
+    # Get ticks BEFORE death (not at death - weapon is None when dead)
+    # Check 1-2 ticks before death to get the weapon they were holding
+    pre_death_ticks = []
+    death_tick_map = {}  # pre_tick -> original death tick
+    
+    for _, death in player_deaths.iterrows():
+        death_tick = int(death["tick"])
+        # Check 1 tick before death
+        pre_tick = death_tick - 1
+        pre_death_ticks.append(pre_tick)
+        death_tick_map[pre_tick] = death_tick
+    
+    try:
+        # Parse player state at PRE-death ticks
+        player_data = parser.parse_ticks(["active_weapon_name"], ticks=pre_death_ticks)
+    except Exception:
+        player_data = pd.DataFrame()
+    
+    if player_data.empty:
+        return pd.DataFrame()
+    
+    knife_deaths = []
+    
+    # Weapons that indicate bomb/environment kills (not player fault for having knife)
+    bomb_weapons = {"planted_c4", "c4_planted", "inferno", "hegrenade", "world"}
+    
+    for _, death in player_deaths.iterrows():
+        victim = death["user_name"]
+        death_tick = int(death["tick"])
+        pre_tick = death_tick - 1
+        attacker = death.get("attacker_name", "Unknown") or "Unknown"
+        attacker_weapon = death.get("weapon", "Unknown") or "Unknown"
+        
+        # Skip bomb deaths - not a mistake to have knife out when bomb explodes
+        if attacker_weapon and str(attacker_weapon).lower() in bomb_weapons:
+            continue
+        
+        # Skip suicide/world deaths
+        if not attacker or attacker == "Unknown" or attacker == victim:
+            continue
+        
+        # Find victim's weapon at pre-death tick
+        victim_state = player_data[
+            (player_data["tick"] == pre_tick) & 
+            (player_data["name"] == victim)
+        ]
+        
+        if victim_state.empty:
+            # Try exact death tick as fallback (might work for some demos)
+            victim_state = player_data[
+                (player_data["tick"] == death_tick) & 
+                (player_data["name"] == victim)
+            ]
+        
+        if victim_state.empty:
+            continue
+        
+        active_weapon = victim_state.iloc[0].get("active_weapon_name", "")
+        
+        # Skip if no weapon data
+        if not active_weapon:
+            continue
+        
+        # Check if holding knife (includes all knife variants)
+        weapon_lower = str(active_weapon).lower()
+        is_knife = "knife" in weapon_lower or "bayonet" in weapon_lower or "karambit" in weapon_lower
+        
+        if is_knife:
+            knife_deaths.append({
+                "player": victim,
+                "tick": death_tick,
+                "time_s": round(death_tick / tickrate, 1),
+                "active_weapon": active_weapon,
+                "killed_by": attacker,
+                "killer_weapon": attacker_weapon,
+            })
+    
+    df = pd.DataFrame(knife_deaths)
+    if not df.empty:
+        df = df.sort_values("time_s")
+    return df
+
+
 def get_demo_info(demo_path: Path, tickrate: float = 64.0) -> dict:
     """Get basic demo info"""
     if not HAS_PARSER:
@@ -428,23 +545,59 @@ def decode_share_code(code: str) -> tuple:
     return int(ids["matchid"]), int(ids["outcomeid"]), int(ids["token"])
 
 
-def download_file(url: str, out_path: Path, timeout_s: int = 120, log: logging.Logger = None) -> bool:
+def download_file(url: str, out_path: Path, timeout_s: int = 120, log: logging.Logger = None, max_retries: int = 3) -> bool:
+    """Download file with retry logic for rate limiting"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if log:
         log.info(f"Downloading: {url}")
     
-    try:
-        with http_requests.get(url, stream=True, timeout=timeout_s) as r:
-            r.raise_for_status()
-            with out_path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 512):
-                    if chunk:
-                        f.write(chunk)
-        return True
-    except Exception as e:
-        if log:
-            log.error(f"Download failed: {e}")
-        return False
+    for attempt in range(max_retries):
+        try:
+            with http_requests.get(url, stream=True, timeout=timeout_s) as r:
+                # Check for rate limiting
+                if r.status_code == 429:
+                    wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s
+                    if log:
+                        log.warning(f"Rate limited (429), waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # Check for Akamai CDN errors (usually HTML with Reference #)
+                content_type = r.headers.get("content-type", "")
+                if "text/html" in content_type and r.status_code >= 400:
+                    wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s
+                    if log:
+                        log.warning(f"CDN rate limit detected, waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                
+                r.raise_for_status()
+                with out_path.open("wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 512):
+                        if chunk:
+                            f.write(chunk)
+            return True
+        except http_requests.exceptions.HTTPError as e:
+            if "429" in str(e) or "too many" in str(e).lower():
+                wait_time = 60 * (attempt + 1)
+                if log:
+                    log.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+                continue
+            if log:
+                log.error(f"Download failed: {e}")
+            return False
+        except Exception as e:
+            if log:
+                log.error(f"Download failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+                continue
+            return False
+    
+    if log:
+        log.error(f"Download failed after {max_retries} attempts")
+    return False
 
 
 def get_next_sharecode_webapi(
@@ -453,7 +606,9 @@ def get_next_sharecode_webapi(
     auth_code: str,
     known_code: str,
     log: logging.Logger,
+    max_retries: int = 3,
 ) -> Optional[str]:
+    """Get next sharecode with retry logic for rate limiting"""
     url = "https://api.steampowered.com/ICSGOPlayers_730/GetNextMatchSharingCode/v1/"
     params = {
         "key": web_api_key,
@@ -462,18 +617,40 @@ def get_next_sharecode_webapi(
         "knowncode": known_code,
     }
     
-    try:
-        r = http_requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        
-        result = data.get("result", {})
-        nextcode = result.get("nextcode", "")
-        
-        if isinstance(nextcode, str) and nextcode.startswith("CSGO-"):
-            return nextcode
-    except Exception as e:
-        log.warning(f"WebAPI error: {e}")
+    for attempt in range(max_retries):
+        try:
+            r = http_requests.get(url, params=params, timeout=20)
+            
+            # Handle rate limiting
+            if r.status_code == 429:
+                wait_time = 30 * (attempt + 1)
+                log.warning(f"Steam API rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            
+            r.raise_for_status()
+            data = r.json()
+            
+            result = data.get("result", {})
+            nextcode = result.get("nextcode", "")
+            
+            if isinstance(nextcode, str) and nextcode.startswith("CSGO-"):
+                return nextcode
+            return None
+        except http_requests.exceptions.HTTPError as e:
+            if "429" in str(e):
+                wait_time = 30 * (attempt + 1)
+                log.warning(f"Rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            log.warning(f"WebAPI error: {e}")
+            return None
+        except Exception as e:
+            log.warning(f"WebAPI error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+                continue
+            return None
     
     return None
 
@@ -579,6 +756,8 @@ class DemoDaemon:
         top_clips: int = 10,
         clip_pre_s: float = 3.0,
         clip_post_s: float = 2.0,
+        download_delay_s: int = 30,  # Delay between demo downloads (avoid rate limit)
+        rate_limit_delay_s: int = 120,  # Delay when rate limited
         log: logging.Logger = None,
     ):
         self.demo_dir = demo_dir
@@ -594,6 +773,8 @@ class DemoDaemon:
         self.top_clips = top_clips
         self.clip_pre_s = clip_pre_s
         self.clip_post_s = clip_post_s
+        self.download_delay_s = download_delay_s
+        self.rate_limit_delay_s = rate_limit_delay_s
         self.log = log or logging.getLogger("daemon")
         
         # Paths
@@ -813,7 +994,7 @@ class DemoDaemon:
         return dem_path
     
     def analyze_demo(self, demo_path: Path) -> List[dict]:
-        """Analyze demo and return clip specifications"""
+        """Analyze demo and return clip specifications for all mistake types"""
         self.log.info(f"Analyzing {demo_path.name} for player '{self.player_name}'...")
         self.status.update(
             phase="analyzing",
@@ -821,33 +1002,47 @@ class DemoDaemon:
             message=f"Analyzing {demo_path.name}..."
         )
         
-        bursts = detect_bursts(demo_path, self.tickrate, self.player_name)
-        if bursts.empty:
-            self.log.info("No bursts found")
-            return []
-        
-        oversprays = detect_oversprays(demo_path, bursts, self.tickrate)
-        if oversprays.empty:
-            self.log.info("No oversprays found")
-            return []
-        
-        # Save analysis
+        clips = []
         demo_out = self.output_dir / demo_path.stem
         demo_out.mkdir(parents=True, exist_ok=True)
-        oversprays.to_parquet(demo_out / "overspray_candidates.parquet")
         
-        # Build clips
-        top = oversprays.head(self.top_clips)
-        clips = []
-        for _, row in top.iterrows():
-            start_s = max(0.0, row["start_s"] - self.clip_pre_s)
-            end_s = row["death_s"] + self.clip_post_s
-            clips.append({
-                "start_s": round(start_s, 3),
-                "duration_s": round(end_s - start_s, 3),
-            })
+        # === Overspray Detection ===
+        bursts = detect_bursts(demo_path, self.tickrate, self.player_name)
+        if not bursts.empty:
+            oversprays = detect_oversprays(demo_path, bursts, self.tickrate)
+            if not oversprays.empty:
+                oversprays.to_parquet(demo_out / "overspray_candidates.parquet")
+                self.log.info(f"Found {len(oversprays)} oversprays")
+                
+                # Build overspray clips
+                top_oversprays = oversprays.head(self.top_clips)
+                for _, row in top_oversprays.iterrows():
+                    start_s = max(0.0, row["start_s"] - self.clip_pre_s)
+                    end_s = row["death_s"] + self.clip_post_s
+                    clips.append({
+                        "start_s": round(start_s, 3),
+                        "duration_s": round(end_s - start_s, 3),
+                        "type": "overspray",
+                    })
         
-        self.log.info(f"Found {len(clips)} clip candidates")
+        # === Knife Death Detection ===
+        knife_deaths = detect_knife_deaths(demo_path, self.tickrate, self.player_name)
+        if not knife_deaths.empty:
+            knife_deaths.to_parquet(demo_out / "knife_deaths.parquet")
+            self.log.info(f"Found {len(knife_deaths)} knife deaths")
+            
+            # Build knife death clips (limit to top 3)
+            top_knife = knife_deaths.head(3)
+            for _, row in top_knife.iterrows():
+                start_s = max(0.0, row["time_s"] - 5.0)  # 5 seconds before death
+                end_s = row["time_s"] + 2.0  # 2 seconds after death
+                clips.append({
+                    "start_s": round(start_s, 3),
+                    "duration_s": round(end_s - start_s, 3),
+                    "type": "knife_death",
+                })
+        
+        self.log.info(f"Found {len(clips)} total clip candidates")
         return clips
     
     def process_new_demo(self, demo_path: Path) -> bool:
@@ -944,7 +1139,7 @@ class DemoDaemon:
             return False
     
     def delete_demo(self, demo_path: Path) -> bool:
-        """Delete a demo file and its associated files"""
+        """Delete a demo file and its associated files (keeps analysis output for summary)"""
         demo_id = demo_path.stem
         
         try:
@@ -959,10 +1154,8 @@ class DemoDaemon:
                 if assoc.exists():
                     assoc.unlink()
             
-            # Delete analysis output
-            analysis_dir = self.output_dir / demo_id
-            if analysis_dir.exists():
-                shutil.rmtree(analysis_dir)
+            # NOTE: Keep analysis output (parquet files) for summary display in UI
+            # They are small and needed to show stats after cleanup
             
             return True
         except Exception as e:
@@ -1057,9 +1250,16 @@ class DemoDaemon:
                     self.process_new_demo(demo_path)
             except Exception as e:
                 self.log.error(f"Failed to download {next_code}: {e}")
+                # If rate limited, wait longer before retry
+                if "429" in str(e) or "too many" in str(e).lower() or "Reference #" in str(e):
+                    self.log.warning(f"Rate limited! Waiting {self.rate_limit_delay_s} seconds...")
+                    time.sleep(self.rate_limit_delay_s)
             
             current = next_code
-            time.sleep(2)  # Be nice to Valve
+            # Wait between downloads to avoid Akamai CDN rate limit
+            # Demo files are large (~100MB), need to be conservative
+            self.log.debug(f"Waiting {self.download_delay_s}s before next download...")
+            time.sleep(self.download_delay_s)
         
         # Update status
         self.status.update(
@@ -1157,6 +1357,7 @@ class DemoDaemon:
         self.log.info(f"Daemon running. Player: {self.player_name}")
         self.log.info(f"Demo dir: {self.demo_dir}")
         self.log.info(f"Polling every {self.poll_interval_s}s")
+        self.log.info(f"Rate limiting: {self.download_delay_s}s between downloads, {self.rate_limit_delay_s}s on rate limit")
         
         self.status.update(
             phase="idle",
@@ -1208,6 +1409,133 @@ class DemoDaemon:
             self.client.disconnect()
         except Exception:
             pass
+    
+    def run_local(self, reprocess: bool = False):
+        """Process existing demos without Steam login (local-only mode)
+        
+        Use this for testing or when you already have demo files.
+        
+        Args:
+            reprocess: If True, re-analyze demos even if already processed
+        """
+        self.running = True
+        self.log.info("=" * 60)
+        self.log.info("LOCAL-ONLY MODE - Processing existing demos")
+        self.log.info("=" * 60)
+        self.log.info(f"Player: {self.player_name}")
+        self.log.info(f"Demo dir: {self.demo_dir}")
+        if reprocess:
+            self.log.info("Reprocess mode: will re-analyze all demos")
+        
+        self.status.update(
+            running=True,
+            phase="analyzing",
+            message="Local mode: processing existing demos..."
+        )
+        
+        # Ensure directories
+        self.demo_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Find all demo files
+        demos = list(self.demo_dir.glob("*.dem"))
+        self.log.info(f"Found {len(demos)} demo files")
+        
+        if not demos:
+            self.log.warning("No demo files found in demo directory")
+            self.status.update(running=False, phase="complete", message="No demos to process")
+            return
+        
+        # Process each demo
+        total_clips = 0
+        total_oversprays = 0
+        total_knife_deaths = 0
+        processed = 0
+        skipped = 0
+        
+        for demo_path in sorted(demos, key=lambda p: p.stat().st_mtime):
+            demo_id = demo_path.stem
+            
+            # Skip if already processed (unless reprocess flag)
+            if not reprocess and self.state.is_processed(demo_id):
+                self.log.info(f"Skipping already processed: {demo_path.name}")
+                skipped += 1
+                continue
+            
+            self.log.info(f"\nAnalyzing: {demo_path.name}")
+            self.log.info("-" * 40)
+            self.status.update(
+                current_demo=demo_path.name,
+                message=f"Analyzing {demo_path.name}..."
+            )
+            
+            try:
+                clips = self.analyze_demo(demo_path)
+                
+                # Count by type
+                overspray_clips = [c for c in clips if c.get("type") == "overspray"]
+                knife_clips = [c for c in clips if c.get("type") == "knife_death"]
+                
+                if overspray_clips:
+                    self.log.info(f"  🔫 Oversprays: {len(overspray_clips)}")
+                    total_oversprays += len(overspray_clips)
+                if knife_clips:
+                    self.log.info(f"  🔪 Knife deaths: {len(knife_clips)}")
+                    total_knife_deaths += len(knife_clips)
+                
+                if clips:
+                    self.state.add_to_batch(demo_id, str(demo_path), clips)
+                    total_clips += len(clips)
+                else:
+                    self.log.info(f"  ✅ No mistakes found")
+                
+                self.state.mark_processed(demo_id)
+                processed += 1
+                
+            except Exception as e:
+                self.log.error(f"  Error analyzing {demo_path.name}: {e}")
+                continue
+        
+        # Print summary
+        self.log.info("")
+        self.log.info("=" * 60)
+        self.log.info("ANALYSIS COMPLETE")
+        self.log.info("=" * 60)
+        self.log.info(f"Demos processed: {processed}")
+        if skipped > 0:
+            self.log.info(f"Demos skipped (already processed): {skipped}")
+        self.log.info(f"Total mistakes found: {total_clips}")
+        self.log.info(f"  🔫 Oversprays: {total_oversprays}")
+        self.log.info(f"  🔪 Knife deaths: {total_knife_deaths}")
+        
+        # Show output location
+        self.log.info("")
+        self.log.info(f"Analysis results saved to: {self.output_dir}")
+        
+        # Send batch to Windows if we have clips and Windows is configured
+        pending = self.state.get_pending_batch()
+        if pending and self.windows_url:
+            self.log.info("")
+            self.log.info(f"Sending {total_clips} clips to Windows...")
+            try:
+                self.send_pending_batch()
+                self.log.info("Batch sent successfully")
+            except Exception as e:
+                self.log.error(f"Failed to send batch: {e}")
+        elif pending:
+            self.log.info("")
+            self.log.info("ℹ️  No Windows URL configured - clips not sent")
+            self.log.info("   Configure WINDOWS_BASE_URL to enable clip recording")
+            self.log.info("   Or use the Web UI to view analysis results")
+        
+        self.status.update(
+            running=False,
+            phase="complete",
+            message=f"Processed {processed} demos: {total_oversprays} oversprays, {total_knife_deaths} knife deaths"
+        )
+        
+        self.log.info("Local processing complete")
     
     def stop(self):
         self.running = False
@@ -1296,12 +1624,24 @@ def main():
     ap.add_argument("--gc-version", type=int, default=int(os.environ.get("GC_VERSION", "2000696")))
     ap.add_argument("--poll-interval", type=int, default=300, help="Seconds between checks")
     
+    # Rate limiting settings
+    ap.add_argument("--download-delay", type=int, 
+                    default=int(os.environ.get("DOWNLOAD_DELAY_S", "30")),
+                    help="Seconds between demo downloads (default: 30)")
+    ap.add_argument("--rate-limit-delay", type=int,
+                    default=int(os.environ.get("RATE_LIMIT_DELAY_S", "120")),
+                    help="Seconds to wait when rate limited (default: 120)")
+    
     ap.add_argument("--windows-url", default=os.environ.get("WINDOWS_BASE_URL", "http://10.0.0.108:8788"))
     ap.add_argument("--ubuntu-url", default=os.environ.get("UBUNTU_BASE_URL", "http://10.0.0.196:8787"))
     
     ap.add_argument("--api-port", type=int, default=8790)
     ap.add_argument("--no-api", action="store_true")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--local-only", action="store_true",
+                    help="Process existing demos only, no Steam login/download")
+    ap.add_argument("--reprocess", action="store_true",
+                    help="Re-analyze demos even if already processed (use with --local-only)")
     
     args = ap.parse_args()
     
@@ -1317,6 +1657,8 @@ def main():
         windows_url=args.windows_url,
         ubuntu_url=args.ubuntu_url,
         clip_token=os.environ.get("CLIP_TOKEN", "token"),
+        download_delay_s=args.download_delay,
+        rate_limit_delay_s=args.rate_limit_delay,
         log=log,
     )
     
@@ -1338,7 +1680,11 @@ def main():
             api_thread.start()
             log.info(f"API: http://localhost:{args.api_port}")
     
-    daemon.run()
+    if args.local_only:
+        # Process existing demos without Steam login
+        daemon.run_local(reprocess=args.reprocess)
+    else:
+        daemon.run()
 
 
 if __name__ == "__main__":
